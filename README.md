@@ -50,9 +50,9 @@ systemctl restart hysteria-control
 
 Open the panel at its root URL (for example, `https://your-domain:8443/`). Action paths such as `/add`, `/toggle`, `/delete`, `/sni`, and `/password` are form endpoints, not pages; opening them directly with a browser GET redirects to the panel home without changing anything.
 
-Administrators can change their password from the dashboard. The form requires the current password and a matching new password of at least 12 characters. The new password is stored as a salted PBKDF2 hash in the private SQLite database; changing it invalidates existing panel sessions.
+Administrators can open the password form from the button beside the theme switch. The form requires the current password and a matching new password of at least 12 characters. The new password is stored as a salted PBKDF2 hash in the private SQLite database; changing it invalidates existing panel sessions.
 
-At least one VPN user must stay enabled because Hysteria cannot start with an empty `userpass` list. New usernames use lowercase Latin letters, numbers, `_`, or `-`.
+At least one VPN user must stay enabled because Hysteria cannot start with an empty `userpass` list. New usernames use Latin letters (including uppercase), numbers, `_`, or `-`. Names that differ only by letter case are treated as duplicates.
 
 Hysteria is installed through the [official Hysteria server installation script](https://v2.hysteria.network/docs/getting-started/Server-Installation-Script/) and uses the official `userpass`, TLS, and Traffic Stats API configuration. The SNI must match the installed certificate domain; changing to another SNI requires a certificate for that domain.
 
