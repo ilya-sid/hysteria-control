@@ -1,4 +1,4 @@
-import os, sqlite3, secrets, subprocess, re, json, urllib.request, urllib.parse, sys
+import os, sqlite3, secrets, subprocess, re, json, urllib.request, urllib.parse, sys, hashlib, base64
 from flask import Flask, request, session, redirect, abort, make_response, Response
 
 APP_DIR=os.environ.get('HY_CONTROL_DIR','/opt/hysteria-control')
@@ -28,6 +28,23 @@ def setting(key,default=''):
     c=conn(); r=c.execute('select value from settings where key=?',(key,)).fetchone(); c.close(); return r['value'] if r else default
 def put_setting(key,value):
     c=conn(); c.execute('insert into settings values(?,?) on conflict(key) do update set value=excluded.value',(key,value)); c.commit(); c.close()
+def hash_password(password):
+    salt=secrets.token_bytes(16); rounds=310000
+    digest=hashlib.pbkdf2_hmac('sha256',password.encode(),salt,rounds)
+    return f'pbkdf2_sha256${rounds}${base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(digest).decode()}'
+def verify_password(password,encoded):
+    try:
+        scheme,rounds,salt,digest=encoded.split('$',3)
+        rounds=int(rounds)
+        if scheme!='pbkdf2_sha256' or not 100000<=rounds<=1000000: return False
+        candidate=hashlib.pbkdf2_hmac('sha256',password.encode(),base64.urlsafe_b64decode(salt),rounds)
+        return secrets.compare_digest(base64.urlsafe_b64encode(candidate).decode(),digest)
+    except (ValueError,TypeError): return False
+def admin_password_matches(password):
+    stored=setting('admin_password_hash')
+    if stored: return verify_password(password,stored)
+    return secrets.compare_digest(password,os.environ['PANEL_PASS'])
+def auth_version(): return setting('admin_auth_version','legacy')
 def api_get(path):
     with open(API_SECRET_FILE) as f: secret=f.read().strip()
     req=urllib.request.Request(API+path,headers={'Authorization':secret})
@@ -82,7 +99,7 @@ function copyLink(btn){navigator.clipboard.writeText(btn.dataset.link);let t=btn
     html=html.replace('__CSS__',css).replace('__THEME__',theme).replace('__BODY__',body).replace('__SCRIPT__',script)
     return make_response(html)
 
-def logged(): return session.get('ok') is True
+def logged(): return session.get('ok') is True and session.get('auth_version')==auth_version()
 def csrf():
     if 'csrf' not in session: session['csrf']=secrets.token_hex(16)
     return session['csrf']
@@ -94,7 +111,10 @@ LOGIN='''<div class="top"><div class="brand"><div class=logo>H</div><div><h1>Hys
 @app.route('/',methods=['GET','POST'])
 def home():
     if request.method=='POST':
-        if request.form.get('user')==os.environ['PANEL_USER'] and secrets.compare_digest(request.form.get('password',''),os.environ['PANEL_PASS']): session['ok']=True; return redirect('/')
+        password=request.form.get('password','')
+        if request.form.get('user')==os.environ['PANEL_USER'] and admin_password_matches(password):
+            if not setting('admin_password_hash'): put_setting('admin_password_hash',hash_password(password))
+            session['ok']=True; session['auth_version']=auth_version(); return redirect('/')
         return page(LOGIN.replace('Личный сервер','Неверный логин или пароль'))
     if not logged(): return page(LOGIN)
     c=conn(); users=c.execute('select username,password,enabled from users order by username').fetchall(); c.close()
@@ -103,6 +123,7 @@ def home():
 <div class=hero><div><h2>Обзор сервера</h2><p>Состояние узла и активность подключений</p></div><div class=live><span class="lamp" id=serviceLamp></span><span id=serviceText>Проверяем сервер</span><span class=pill>обновление каждые 15 сек</span></div></div>
 <div class=grid><div class="card metric"><div class=label>Средняя нагрузка · 1 мин</div><strong><span data-metric=load>—</span></strong><div class=sub>среднее значение системы</div></div><div class="card metric"><div class=label>Оперативная память</div><strong><span data-metric=ram>—</span></strong><div class=bar><i id=ramBar></i></div></div><div class="card metric"><div class=label>Swap</div><strong><span data-metric=swap>—</span></strong><div class=bar><i id=swapBar></i></div></div><div class="card metric"><div class=label>Диск</div><strong><span data-metric=disk>—</span></strong><div class=bar><i id=diskBar></i></div></div></div>
 <section class="card server-card"><div class=server-row><div class=server-info><span class=lamp id=serviceLamp2></span><div><h3>Hysteria2</h3><p>UDP/443 · {DOMAIN}</p></div></div><form method=post action=/sni><input type=hidden name=csrf value="{tok}"><div class=sni-row><input name=sni value="{sni}" aria-label="SNI"><button class=small>Сохранить SNI</button></div></form></div></section>
+<section class="card server-card"><div class=section-head style="margin:0 0 12px"><div><h3>Пароль администратора</h3><p>Текущий пароль потребуется для подтверждения</p></div></div><form class=form-row method=post action=/password><input type=hidden name=csrf value="{tok}"><input type=password name=current_password placeholder="Текущий пароль" autocomplete=current-password required><input type=password name=new_password placeholder="Новый пароль (от 12 символов)" autocomplete=new-password minlength=12 maxlength=256 required><input type=password name=confirm_password placeholder="Повторите новый пароль" autocomplete=new-password minlength=12 maxlength=256 required><button class=primary>Сменить пароль</button></form></section>
 <div class=section-head><div><h3>Пользователи</h3><p>Индивидуальные подключения и их трафик</p></div><span class=pill>{len(users)} всего</span></div>
 <section class=card><form class=form-row method=post action=/add><input type=hidden name=csrf value="{tok}"><input name=u placeholder="Имя нового пользователя" pattern="[A-Za-z0-9_-]{{1,32}}" required><button class=primary>＋ Добавить пользователя</button></form><div style="margin-top:14px">'''
     if not users: body+='<div class=empty>Пока нет пользователей. Добавьте первого выше.</div>'
@@ -114,8 +135,28 @@ def home():
     body+='''</div></section><div class=footer-note>Индикатор показывает текущую сессию Hysteria2. Трафик — накопительно с момента добавления пользователя.</div>'''
     return page(body)
 
-@app.post('/add')
+@app.route('/password',methods=['GET','POST'])
+def change_password():
+    if request.method=='GET': return redirect('/')
+    if not logged(): abort(403)
+    check()
+    current=request.form.get('current_password','')
+    new=request.form.get('new_password','')
+    confirm=request.form.get('confirm_password','')
+    if not admin_password_matches(current):
+        return page('<div class="card login"><h2>Текущий пароль неверен</h2><a href="/"><button>Назад</button></a></div>')
+    if len(new)<12 or len(new)>256:
+        return page('<div class="card login"><h2>Пароль должен содержать от 12 до 256 символов</h2><a href="/"><button>Назад</button></a></div>')
+    if not secrets.compare_digest(new,confirm):
+        return page('<div class="card login"><h2>Новые пароли не совпадают</h2><a href="/"><button>Назад</button></a></div>')
+    put_setting('admin_password_hash',hash_password(new))
+    put_setting('admin_auth_version',secrets.token_urlsafe(24))
+    session.clear()
+    return page('<div class="card login"><h2>Пароль изменён</h2><p class=muted>Войдите снова с новым паролем.</p><a href="/"><button class=primary>Перейти ко входу</button></a></div>')
+
+@app.route('/add',methods=['GET','POST'])
 def add():
+    if request.method=='GET': return redirect('/')
     if not logged(): abort(403)
     check(); u=request.form.get('u','')
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,32}',u): abort(400)
@@ -123,16 +164,19 @@ def add():
     try: c.execute('insert into users(username,password,enabled) values(?,?,1)',(u,secrets.token_urlsafe(20))); c.commit()
     except sqlite3.IntegrityError: pass
     c.close(); sync(); return redirect('/')
-@app.post('/toggle')
+@app.route('/toggle',methods=['GET','POST'])
 def toggle():
+    if request.method=='GET': return redirect('/')
     if not logged(): abort(403)
     check(); c=conn(); c.execute('update users set enabled=1-enabled where username=?',(request.form.get('u'),)); c.commit(); c.close(); sync(); return redirect('/')
-@app.post('/delete')
+@app.route('/delete',methods=['GET','POST'])
 def delete():
+    if request.method=='GET': return redirect('/')
     if not logged(): abort(403)
     check(); username=request.form.get('u'); record_traffic(); c=conn(); c.execute('delete from users where username=?',(username,)); c.commit(); c.close(); sync(); return redirect('/')
-@app.post('/sni')
+@app.route('/sni',methods=['GET','POST'])
 def sni():
+    if request.method=='GET': return redirect('/')
     if not logged(): abort(403)
     check(); value=request.form.get('sni','').strip().lower()
     if value!=DOMAIN: return page('<div class="card">SNI должен совпадать с доменом TLS-сертификата: '+DOMAIN+'.</div><a href="/"><button>Назад</button></a>')

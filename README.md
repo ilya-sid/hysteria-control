@@ -1,31 +1,44 @@
 # Hysteria Control
 
-[English version](#english)
+A lightweight, self-hosted Hysteria 2 server and web panel for managing users, connection links, QR codes, traffic, and basic server health. The panel is a small Flask app with SQLite; there is no Docker, Nginx, PostgreSQL, or separate frontend build.
 
-Лёгкая панель управления сервером Hysteria 2: создание и отключение пользователей, ссылки и QR-коды подключений, статистика трафика и состояние сервера. Панель написана на Flask и использует SQLite. Docker, Nginx, PostgreSQL и отдельная сборка фронтенда не требуются.
+## One-command installation
 
-## Установка одной командой
+Requirements:
 
-Поддерживаются Ubuntu 22.04+ и Debian 11+ с systemd. Нужны root-доступ, публичный сервер и домен, DNS-запись которого уже указывает на сервер. Должны быть доступны TCP/80 для получения TLS-сертификата Let's Encrypt, UDP/443 для Hysteria и TCP/8443 для панели (по умолчанию). Рекомендуется 1 ГБ RAM; 512 МБ — практический минимум.
+- Ubuntu 22.04+ or Debian 11+ with systemd and root access.
+- A public server and a domain whose DNS already points to it.
+- TCP port 80 reachable temporarily/permanently for Let's Encrypt, UDP port 443 for Hysteria, and TCP port 8443 for the panel by default.
+- 1 vCPU and 1 GB RAM recommended; 512 MB RAM is a practical minimum.
 
-Запустите на чистом сервере из интерактивного терминала:
+Run this on a fresh server from an interactive terminal:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ilya-sid/hysteria-control/main/install.sh | sudo bash
 ```
 
-Установщик спросит домен, email для Let's Encrypt и логин панели. По умолчанию устанавливается Hysteria v2.12.3. Панельный пароль и секрет API создаются случайно; начальный пароль панели будет показан один раз в конце — сохраните его. Сервис панели работает от отдельной непривилегированной учётной записи.
+The installer asks for the domain, a Let's Encrypt contact email, and the panel login. It pins Hysteria to v2.12.3 by default, creates random panel and API secrets, and prints the initial panel password once. Save it. Secret files are readable only by root and the dedicated panel service account.
 
-Чтобы передать значения заранее и пропустить вопросы установщика:
+To set values without the prompts, export them in the shell before running the command:
 
 ```sh
 export HC_DOMAIN=vpn.example.com HC_EMAIL=admin@example.com HC_PANEL_USER=admin
 curl -fsSL https://raw.githubusercontent.com/ilya-sid/hysteria-control/main/install.sh | sudo --preserve-env=HC_DOMAIN,HC_EMAIL,HC_PANEL_USER bash
 ```
 
-Панель использует TCP/8443 (порт можно изменить переменной PANEL_PORT), Hysteria — UDP/443. TCP/80 нужен для выпуска и обновления сертификата. Если UFW уже включён, установщик добавит правила для необходимых портов; иначе настройте firewall у хостинг-провайдера. Установщик не перезаписывает найденную конфигурацию/службу Hysteria и остановится, если нужные порты заняты. Он предназначен для чистого сервера и не удаляет существующие службы.
+To install a different Hysteria version, set `HY2_VERSION`, for example `v2.12.3`. The script refuses to overwrite an existing Hysteria config/service, an existing `/opt/hysteria-control`, or occupied required ports. It does not migrate or remove existing services.
 
-## Службы и диагностика
+## What it installs
+
+- Hysteria 2 on UDP/443, with per-user credentials and its stats API bound to `127.0.0.1:9999`.
+- The HTTPS panel on TCP/8443 (or `PANEL_PORT` if set).
+- A Let's Encrypt certificate for the chosen domain, with automatic renewal. Renewals reload the panel certificate.
+- A private SQLite database under `/var/lib/hysteria-control` and secrets/configuration under `/etc/hysteria-control`.
+- The web panel runs as a dedicated unprivileged account. A fixed root-owned helper performs only the Hysteria config rebuild and service restart needed for user management.
+
+If UFW is already active, the installer opens TCP/80, TCP/8443 (or your selected `PANEL_PORT`), and UDP/443. Otherwise, open those ports in your VPS provider's firewall. TCP/80 is needed for certificate issuance and renewal. Set `PANEL_PORT` in the environment to change the panel port.
+
+## Services and troubleshooting
 
 ```sh
 systemctl status hysteria-server hysteria-control --no-pager
@@ -33,42 +46,20 @@ journalctl -u hysteria-server -u hysteria-control -n 100 --no-pager
 systemctl restart hysteria-control
 ```
 
-Для TLS используется сертификат Let's Encrypt для указанного домена. SNI должен совпадать с доменом сертификата. Перед ручными изменениями сделайте резервные копии базы /var/lib/hysteria-control/panel.db, конфигурации /etc/hysteria/config.yaml и файла настроек /etc/hysteria-control/panel.env.
+Open the panel at its root URL (for example, `https://your-domain:8443/`). Action paths such as `/add`, `/toggle`, `/delete`, `/sni`, and `/password` are form endpoints, not pages; opening them directly with a browser GET redirects to the panel home without changing anything.
 
-## English
+Administrators can change their password from the dashboard. The form requires the current password and a matching new password of at least 12 characters. The new password is stored as a salted PBKDF2 hash in the private SQLite database; changing it invalidates existing panel sessions.
 
-A lightweight Hysteria 2 server and web panel for managing users, connection links, QR codes, traffic, and basic server health. Built with Flask and SQLite; no Docker, Nginx, PostgreSQL, or frontend build is required.
+Hysteria is installed through the [official Hysteria server installation script](https://v2.hysteria.network/docs/getting-started/Server-Installation-Script/) and uses the official `userpass`, TLS, and Traffic Stats API configuration. The SNI must match the installed certificate domain; changing to another SNI requires a certificate for that domain.
 
-### One-command installation
+The installer targets a fresh Ubuntu/Debian server. Back up `/var/lib/hysteria-control/panel.db`, `/etc/hysteria/config.yaml`, and `/etc/hysteria-control/panel.env` before making manual changes. Keep the panel password private and restrict TCP/8443 at your provider firewall if you know the networks from which you administer the server.
 
-Requirements: Ubuntu 22.04+ or Debian 11+ with systemd and root access; a public server and a domain already pointed to it; TCP port 80 reachable for Let's Encrypt, UDP/443 for Hysteria, and TCP/8443 for the panel by default. Recommended: 1 vCPU and 1 GB RAM (512 MB minimum).
-
-Run on a fresh server from an interactive terminal:
+## Development checks
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ilya-sid/hysteria-control/main/install.sh | sudo bash
+bash -n install.sh
+python3 -m py_compile app.py
 ```
-
-The installer asks for the domain, a Let's Encrypt contact email, and panel login. Hysteria is pinned to v2.12.3 by default. Random panel/API secrets are generated; save the initial panel password printed once after installation. The panel runs under a dedicated unprivileged account.
-
-For non-interactive setup, export values before running the installer:
-
-```sh
-export HC_DOMAIN=vpn.example.com HC_EMAIL=admin@example.com HC_PANEL_USER=admin
-curl -fsSL https://raw.githubusercontent.com/ilya-sid/hysteria-control/main/install.sh | sudo --preserve-env=HC_DOMAIN,HC_EMAIL,HC_PANEL_USER bash
-```
-
-The panel uses TCP/8443 by default (customize with PANEL_PORT); Hysteria uses UDP/443. TCP/80 is required for certificate issuance and renewal. If UFW is active, the installer opens the required ports; otherwise, configure your provider firewall. The installer refuses to overwrite existing Hysteria configuration/services or occupied required ports. It is intended for a fresh server and does not remove existing services.
-
-### Services and troubleshooting
-
-```sh
-systemctl status hysteria-server hysteria-control --no-pager
-journalctl -u hysteria-server -u hysteria-control -n 100 --no-pager
-systemctl restart hysteria-control
-```
-
-Hysteria is installed using the [official server installation script](https://v2.hysteria.network/docs/getting-started/Server-Installation-Script/) and official userpass, TLS, and Traffic Stats API settings. SNI must match the installed certificate domain. Back up /var/lib/hysteria-control/panel.db, /etc/hysteria/config.yaml, and /etc/hysteria-control/panel.env before manual changes.
 
 ## License
 
