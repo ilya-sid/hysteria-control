@@ -1,5 +1,7 @@
 # Hysteria Control
 
+[Русская версия](README.ru.md)
+
 A lightweight, self-hosted Hysteria 2 server and web panel for managing users, connection links, QR codes, traffic, and basic server health. The panel is a small Flask app with SQLite; there is no Docker, Nginx, PostgreSQL, or separate frontend build.
 
 ## One-command installation
@@ -11,28 +13,28 @@ Requirements:
 - TCP port 80 reachable temporarily/permanently for Let's Encrypt, UDP port 443 for Hysteria, and TCP port 8443 for the panel by default.
 - 1 vCPU and 1 GB RAM recommended; 512 MB RAM is a practical minimum.
 
-Run this on a fresh server from an interactive terminal:
+Run this from an interactive terminal:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ilya-sid/hysteria-control/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/ilya-sid/hysteria-control/main/install.sh -o /tmp/hysteria-control-install.sh && sudo bash /tmp/hysteria-control-install.sh
 ```
 
-The installer asks for the domain, a Let's Encrypt contact email, and the panel login. It pins Hysteria to v2.12.3 by default, creates random panel and API secrets, and prints the initial panel password once. Save it. Secret files are readable only by root and the dedicated panel service account.
+The installer asks for the domain, a Let's Encrypt contact email, and the panel login. It pins Hysteria to v2.12.3 by default, creates random panel and API secrets and a first VPN user named `primary`, then prints the panel password and initial connection link. Save them. Secret files are readable only by root and the dedicated panel service account.
 
 To set values without the prompts, export them in the shell before running the command:
 
 ```sh
 export HC_DOMAIN=vpn.example.com HC_EMAIL=admin@example.com HC_PANEL_USER=admin
-curl -fsSL https://raw.githubusercontent.com/ilya-sid/hysteria-control/main/install.sh | sudo --preserve-env=HC_DOMAIN,HC_EMAIL,HC_PANEL_USER bash
+curl -fsSL https://raw.githubusercontent.com/ilya-sid/hysteria-control/main/install.sh -o /tmp/hysteria-control-install.sh && sudo --preserve-env=HC_DOMAIN,HC_EMAIL,HC_PANEL_USER bash /tmp/hysteria-control-install.sh
 ```
 
-To install a different Hysteria version, set `HY2_VERSION`, for example `v2.12.3`. The script refuses to overwrite an existing Hysteria config/service, an existing `/opt/hysteria-control`, or occupied required ports. It does not migrate or remove existing services.
+To install a different Hysteria version, set `HY2_VERSION`, for example `v2.12.3`. An existing Hysteria service is reconfigured for this panel and its config is backed up. Existing Hysteria users are not imported; their old links stop working after reconfiguration. The installer refuses to overwrite an existing panel installation or use occupied required ports.
 
 ## What it installs
 
 - Hysteria 2 on UDP/443, with per-user credentials and its stats API bound to `127.0.0.1:9999`.
 - The HTTPS panel on TCP/8443 (or `PANEL_PORT` if set).
-- A Let's Encrypt certificate for the chosen domain, with automatic renewal. Renewals reload the panel certificate.
+- A Let's Encrypt certificate for the chosen domain, with automatic renewal. Renewals restart both the panel and Hysteria so they use the new certificate.
 - A private SQLite database under `/var/lib/hysteria-control` and secrets/configuration under `/etc/hysteria-control`.
 - The web panel runs as a dedicated unprivileged account. A fixed root-owned helper performs only the Hysteria config rebuild and service restart needed for user management.
 
@@ -49,6 +51,8 @@ systemctl restart hysteria-control
 Open the panel at its root URL (for example, `https://your-domain:8443/`). Action paths such as `/add`, `/toggle`, `/delete`, `/sni`, and `/password` are form endpoints, not pages; opening them directly with a browser GET redirects to the panel home without changing anything.
 
 Administrators can change their password from the dashboard. The form requires the current password and a matching new password of at least 12 characters. The new password is stored as a salted PBKDF2 hash in the private SQLite database; changing it invalidates existing panel sessions.
+
+At least one VPN user must stay enabled because Hysteria cannot start with an empty `userpass` list. New usernames use lowercase Latin letters, numbers, `_`, or `-`.
 
 Hysteria is installed through the [official Hysteria server installation script](https://v2.hysteria.network/docs/getting-started/Server-Installation-Script/) and uses the official `userpass`, TLS, and Traffic Stats API configuration. The SNI must match the installed certificate domain; changing to another SNI requires a certificate for that domain.
 

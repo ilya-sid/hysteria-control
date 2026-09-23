@@ -41,7 +41,7 @@ PANEL_PORT=$((10#$PANEL_PORT))
 (( PANEL_PORT >= 1024 && PANEL_PORT <= 65535 && PANEL_PORT != 80 && PANEL_PORT != 443 )) || die 'Panel port must be between 1024 and 65535, except 80 and 443.'
 
 HY2_EXISTING=0
-if systemctl is-active --quiet hysteria-server.service || command -v hysteria >/dev/null 2>&1 || [[ -e /etc/hysteria/config.yaml ]]; then
+if systemctl list-unit-files hysteria-server.service --no-legend 2>/dev/null | grep -q '^hysteria-server.service'; then
   HY2_EXISTING=1
   printf 'Existing Hysteria installation detected; it will be reconfigured for Hysteria Control. A timestamped backup will be kept.\n'
 fi
@@ -64,6 +64,9 @@ curl -fsSL "$APP_SOURCE" -o "$APP_TMP"
 if ss -H -ltn | awk '{print $4}' | grep -Eq ":(80|${PANEL_PORT})$"; then
   die 'A required TCP port (80 or the chosen panel port) is already in use.'
 fi
+if (( HY2_EXISTING == 0 )) && ss -H -lun | awk '{print $4}' | grep -Eq ':443$'; then
+  die 'UDP/443 is already in use by another service.'
+fi
 
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
   ufw allow 80/tcp
@@ -81,6 +84,13 @@ fi
 
 getent group hysteria-control >/dev/null || groupadd --system hysteria-control
 id hysteria-control >/dev/null 2>&1 || useradd --system --gid hysteria-control --home-dir /var/lib/hysteria-control --shell /usr/sbin/nologin --no-create-home hysteria-control
+if (( HY2_EXISTING == 1 )); then
+  HYSTERIA_SERVICE_USER="$(systemctl show hysteria-server.service --property=User --value)"
+  if [[ -n "$HYSTERIA_SERVICE_USER" && "$HYSTERIA_SERVICE_USER" != root ]]; then
+    id "$HYSTERIA_SERVICE_USER" >/dev/null 2>&1 || die "The existing Hysteria service user ${HYSTERIA_SERVICE_USER} does not exist."
+    usermod -a -G hysteria-control "$HYSTERIA_SERVICE_USER"
+  fi
+fi
 install -d -o root -g root -m 0755 "$INSTALL_DIR"
 install -d -o root -g hysteria-control -m 0750 "$CONFIG_DIR" "$CONFIG_DIR/tls"
 install -d -o hysteria-control -g hysteria-control -m 0750 /var/lib/hysteria-control
@@ -97,6 +107,20 @@ install -o root -g hysteria-control -m 0640 "/etc/letsencrypt/live/${DOMAIN}/pri
 
 PANEL_PASS="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
 PANEL_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
+PRIMARY_PASS="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+PANEL_PRIMARY_PASS="$PRIMARY_PASS" python3 - <<'PY'
+import os
+import sqlite3
+
+db = '/var/lib/hysteria-control/panel.db'
+connection = sqlite3.connect(db)
+connection.execute('create table if not exists users(username text primary key,password text not null,enabled integer not null default 1)')
+connection.execute('insert or ignore into users(username,password,enabled) values(?,?,1)', ('primary', os.environ['PANEL_PRIMARY_PASS']))
+connection.commit()
+connection.close()
+PY
+chown hysteria-control:hysteria-control /var/lib/hysteria-control/panel.db
+chmod 0600 /var/lib/hysteria-control/panel.db
 cat > "$CONFIG_DIR/panel.env" <<EOF
 PANEL_USER=${PANEL_USER}
 PANEL_PASS=${PANEL_PASS}
@@ -121,7 +145,8 @@ tls:
   key: ${CONFIG_DIR}/tls/privkey.pem
 auth:
   type: userpass
-  userpass: {}
+  userpass:
+    primary: ${PRIMARY_PASS}
 trafficStats:
   listen: 127.0.0.1:9999
   secret: ${API_SECRET}
@@ -131,7 +156,8 @@ masquerade:
     url: https://www.bing.com/
     rewriteHost: true
 EOF
-chmod 0600 /etc/hysteria/config.yaml
+chown root:hysteria-control /etc/hysteria/config.yaml
+chmod 0640 /etc/hysteria/config.yaml
 
 install -o root -g root -m 0644 "$APP_TMP" "$INSTALL_DIR/app.py"
 rm -f "$APP_TMP"
@@ -182,6 +208,7 @@ if [[ "\${RENEWED_LINEAGE:-}" == "/etc/letsencrypt/live/${DOMAIN}" ]]; then
   install -o root -g hysteria-control -m 0644 "\$RENEWED_LINEAGE/fullchain.pem" "${CONFIG_DIR}/tls/fullchain.pem"
   install -o root -g hysteria-control -m 0640 "\$RENEWED_LINEAGE/privkey.pem" "${CONFIG_DIR}/tls/privkey.pem"
   systemctl try-restart hysteria-control.service
+  systemctl try-restart hysteria-server.service
 fi
 EOF
 chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/hysteria-control
@@ -192,9 +219,22 @@ systemctl enable --now hysteria-server.service
 systemctl restart hysteria-server.service
 systemctl enable --now hysteria-control.service
 systemctl enable --now certbot.timer
+systemctl is-active --quiet hysteria-server.service || die 'Hysteria did not start. Check journalctl -u hysteria-server.service.'
+systemctl is-active --quiet hysteria-control.service || die 'The panel did not start. Check journalctl -u hysteria-control.service.'
+PANEL_OK=0
+API_OK=0
+for attempt in 1 2 3 4 5; do
+  if curl -fs --max-time 3 --resolve "${DOMAIN}:${PANEL_PORT}:127.0.0.1" "https://${DOMAIN}:${PANEL_PORT}/" -o /dev/null; then PANEL_OK=1; fi
+  if curl -fs --max-time 3 -H "Authorization: ${API_SECRET}" http://127.0.0.1:9999/online -o /dev/null; then API_OK=1; fi
+  if (( PANEL_OK == 1 && API_OK == 1 )); then break; fi
+  sleep 1
+done
+(( PANEL_OK == 1 )) || die 'The panel did not answer over HTTPS. Check journalctl -u hysteria-control.service.'
+(( API_OK == 1 )) || die 'The Hysteria statistics API did not answer. Check journalctl -u hysteria-server.service.'
 
 printf '\n%s installed successfully.\n' "$PROJECT_NAME"
 printf 'Panel: https://%s:%s\nLogin: %s\nPassword: %s\n' "$DOMAIN" "$PANEL_PORT" "$PANEL_USER" "$PANEL_PASS"
+printf 'Initial VPN user: primary\nConnection: hysteria2://primary:%s@%s:443/?sni=%s&insecure=0#primary\n' "$PRIMARY_PASS" "$DOMAIN" "$DOMAIN"
 printf 'Save the password now. It is also stored in the protected file %s/panel.env.\n' "$CONFIG_DIR"
 if ! command -v ufw >/dev/null 2>&1 || ! ufw status 2>/dev/null | grep -q '^Status: active'; then
   printf 'If your provider has a firewall, allow TCP/80, TCP/%s and UDP/443 there.\n' "$PANEL_PORT"

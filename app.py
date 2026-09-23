@@ -1,4 +1,4 @@
-import os, sqlite3, secrets, subprocess, re, json, urllib.request, urllib.parse, sys, hashlib, base64
+import os, sqlite3, secrets, subprocess, re, json, urllib.request, urllib.parse, sys, hashlib, base64, grp
 from flask import Flask, request, session, redirect, abort, make_response, Response
 
 APP_DIR=os.environ.get('HY_CONTROL_DIR','/opt/hysteria-control')
@@ -69,15 +69,16 @@ def record_traffic():
 def write_server_config():
     record_traffic()
     c=conn(); rows=c.execute('select username,password from users where enabled=1 order by username').fetchall(); c.close()
+    if not rows: raise ValueError('At least one Hysteria user must remain enabled')
     with open(API_SECRET_FILE) as f: api_secret=f.read().strip()
     lines=['listen: :443','tls:','  cert: '+PANEL_CERT,'  key: '+PANEL_KEY,'auth:','  type: userpass','  userpass:']
-    if rows: lines += [f'    {r["username"]}: {r["password"]}' for r in rows]
-    else: lines[-1]='  userpass: {}'
+    lines += [f'    {r["username"]}: {r["password"]}' for r in rows]
     lines += ['trafficStats:','  listen: 127.0.0.1:9999','  secret: '+api_secret,'masquerade:','  type: proxy','  proxy:','    url: https://www.bing.com/','    rewriteHost: true']
     os.makedirs(os.path.dirname(HY2_CONFIG),exist_ok=True)
     p=HY2_CONFIG; tmp=p+'.tmp'
     with open(tmp,'w') as f: f.write('\n'.join(lines)+'\n')
-    os.chmod(tmp,0o600); os.replace(tmp,p)
+    os.chown(tmp,0,grp.getgrnam('hysteria-control').gr_gid)
+    os.chmod(tmp,0o640); os.replace(tmp,p)
     subprocess.run(['systemctl','restart','hysteria-server'],check=True)
 
 def sync():
@@ -125,7 +126,7 @@ def home():
 <section class="card server-card"><div class=server-row><div class=server-info><span class=lamp id=serviceLamp2></span><div><h3>Hysteria2</h3><p>UDP/443 · {DOMAIN}</p></div></div><form method=post action=/sni><input type=hidden name=csrf value="{tok}"><div class=sni-row><input name=sni value="{sni}" aria-label="SNI"><button class=small>Сохранить SNI</button></div></form></div></section>
 <section class="card server-card"><div class=section-head style="margin:0 0 12px"><div><h3>Пароль администратора</h3><p>Текущий пароль потребуется для подтверждения</p></div></div><form class=form-row method=post action=/password><input type=hidden name=csrf value="{tok}"><input type=password name=current_password placeholder="Текущий пароль" autocomplete=current-password required><input type=password name=new_password placeholder="Новый пароль (от 12 символов)" autocomplete=new-password minlength=12 maxlength=256 required><input type=password name=confirm_password placeholder="Повторите новый пароль" autocomplete=new-password minlength=12 maxlength=256 required><button class=primary>Сменить пароль</button></form></section>
 <div class=section-head><div><h3>Пользователи</h3><p>Индивидуальные подключения и их трафик</p></div><span class=pill>{len(users)} всего</span></div>
-<section class=card><form class=form-row method=post action=/add><input type=hidden name=csrf value="{tok}"><input name=u placeholder="Имя нового пользователя" pattern="[A-Za-z0-9_-]{{1,32}}" required><button class=primary>＋ Добавить пользователя</button></form><div style="margin-top:14px">'''
+<section class=card><form class=form-row method=post action=/add><input type=hidden name=csrf value="{tok}"><input name=u placeholder="Имя пользователя (латиницей, строчные)" pattern="[a-z0-9_-]{{1,32}}" required><button class=primary>＋ Добавить пользователя</button></form><div style="margin-top:14px">'''
     if not users: body+='<div class=empty>Пока нет пользователей. Добавьте первого выше.</div>'
     for u in users:
         name=u['username']; uri=f'hysteria2://{name}:{u["password"]}@{DOMAIN}:443/?sni={sni}&insecure=0#{name}'
@@ -159,7 +160,7 @@ def add():
     if request.method=='GET': return redirect('/')
     if not logged(): abort(403)
     check(); u=request.form.get('u','')
-    if not re.fullmatch(r'[A-Za-z0-9_-]{1,32}',u): abort(400)
+    if not re.fullmatch(r'[a-z0-9_-]{1,32}',u): abort(400)
     c=conn()
     try: c.execute('insert into users(username,password,enabled) values(?,?,1)',(u,secrets.token_urlsafe(20))); c.commit()
     except sqlite3.IntegrityError: pass
@@ -168,12 +169,20 @@ def add():
 def toggle():
     if request.method=='GET': return redirect('/')
     if not logged(): abort(403)
-    check(); c=conn(); c.execute('update users set enabled=1-enabled where username=?',(request.form.get('u'),)); c.commit(); c.close(); sync(); return redirect('/')
+    check(); c=conn()
+    target=c.execute('select enabled from users where username=?',(request.form.get('u'),)).fetchone()
+    if target and target['enabled'] and c.execute('select count(*) from users where enabled=1').fetchone()[0]<=1:
+        c.close(); return page('<div class="card login"><h2>Нужен хотя бы один активный пользователь</h2><a href="/"><button>Назад</button></a></div>')
+    c.execute('update users set enabled=1-enabled where username=?',(request.form.get('u'),)); c.commit(); c.close(); sync(); return redirect('/')
 @app.route('/delete',methods=['GET','POST'])
 def delete():
     if request.method=='GET': return redirect('/')
     if not logged(): abort(403)
-    check(); username=request.form.get('u'); record_traffic(); c=conn(); c.execute('delete from users where username=?',(username,)); c.commit(); c.close(); sync(); return redirect('/')
+    check(); username=request.form.get('u'); record_traffic(); c=conn()
+    target=c.execute('select enabled from users where username=?',(username,)).fetchone()
+    if target and target['enabled'] and c.execute('select count(*) from users where enabled=1').fetchone()[0]<=1:
+        c.close(); return page('<div class="card login"><h2>Нужен хотя бы один активный пользователь</h2><a href="/"><button>Назад</button></a></div>')
+    c.execute('delete from users where username=?',(username,)); c.commit(); c.close(); sync(); return redirect('/')
 @app.route('/sni',methods=['GET','POST'])
 def sni():
     if request.method=='GET': return redirect('/')
