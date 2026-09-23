@@ -52,7 +52,9 @@ Administrators can change their password from the dashboard. The form requires t
 
 Hysteria is installed through the [official Hysteria server installation script](https://v2.hysteria.network/docs/getting-started/Server-Installation-Script/) and uses the official `userpass`, TLS, and Traffic Stats API configuration. The SNI must match the installed certificate domain; changing to another SNI requires a certificate for that domain.
 
-The installer targets a fresh Ubuntu/Debian server. Back up `/var/lib/hysteria-control/panel.db`, `/etc/hysteria/config.yaml`, and `/etc/hysteria-control/panel.env` before making manual changes. Keep the panel password private and restrict TCP/8443 at your provider firewall if you know the networks from which you administer the server.
+The installer targets a fresh Ubuntu/Debian server and also detects an existing Hysteria installation. In that case it reconfigures Hysteria for this panel and keeps a timestamped backup of `/etc/hysteria/config.yaml`. Back up `/var/lib/hysteria-control/panel.db`, `/etc/hysteria/config.yaml`, and `/etc/hysteria-control/panel.env` before making manual changes. Keep the panel password private and restrict TCP/8443 at your provider firewall if you know the networks from which you administer the server.
+
+The one-command installer downloads the matching `app.py` automatically. No manual `scp`, `cp`, or creation of `/opt/hysteria-control` is required.
 
 ## Development checks
 
