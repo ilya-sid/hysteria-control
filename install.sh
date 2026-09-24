@@ -7,6 +7,7 @@ PANEL_PORT="${PANEL_PORT:-8443}"
 INSTALL_DIR="/opt/hysteria-control"
 CONFIG_DIR="/etc/hysteria-control"
 APP_SOURCE="${HC_APP_SOURCE:-https://raw.githubusercontent.com/ilya-sid/hysteria-control/main/app.py}"
+ASSET_BASE="https://raw.githubusercontent.com/ilya-sid/hysteria-control/main/assets/fonts"
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 need_tty() { [[ -r /dev/tty && -w /dev/tty ]] || die 'Run this installer from an interactive terminal.'; }
@@ -92,6 +93,7 @@ if (( HY2_EXISTING == 1 )); then
   fi
 fi
 install -d -o root -g root -m 0755 "$INSTALL_DIR"
+install -d -o root -g root -m 0755 "$INSTALL_DIR/assets" "$INSTALL_DIR/assets/fonts"
 install -d -o root -g hysteria-control -m 0750 "$CONFIG_DIR" "$CONFIG_DIR/tls"
 install -d -o hysteria-control -g hysteria-control -m 0750 /var/lib/hysteria-control
 install -d -o root -g root -m 0755 /etc/hysteria
@@ -161,6 +163,12 @@ chmod 0640 /etc/hysteria/config.yaml
 
 install -o root -g root -m 0644 "$APP_TMP" "$INSTALL_DIR/app.py"
 rm -f "$APP_TMP"
+curl -fsSL 'https://raw.githubusercontent.com/ilya-sid/hysteria-control/main/VERSION' -o "$INSTALL_DIR/VERSION"
+chmod 0644 "$INSTALL_DIR/VERSION"
+for font in ibm-plex-sans-cyrillic.woff2 ibm-plex-sans-latin.woff2 ibm-plex-mono-cyrillic.woff2 ibm-plex-mono-latin.woff2 OFL.txt; do
+  curl -fsSL "$ASSET_BASE/$font" -o "$INSTALL_DIR/assets/fonts/$font"
+  chmod 0644 "$INSTALL_DIR/assets/fonts/$font"
+done
 
 cat > /usr/local/sbin/hysteria-control-sync <<'EOF'
 #!/usr/bin/env bash
