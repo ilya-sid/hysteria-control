@@ -52,8 +52,16 @@ systemctl is-active --quiet hysteria-control.service
 set -a
 . "$CONFIG"
 set +a
-# Проверяем локальный listener напрямую: DNS и внешний прокси не должны влиять
-# на обновление, а Host нужен приложению для обычной маршрутизации запроса.
-curl -kfsS --noproxy '*' --max-time 5 -H "Host: ${PANEL_DOMAIN}:${PANEL_PORT}" "https://127.0.0.1:${PANEL_PORT}/" -o /dev/null
+# Ждём готовности Flask после перезапуска: systemd может пометить сервис
+# активным за несколько секунд до открытия HTTPS-порта.
+ready=0
+for _ in $(seq 1 20); do
+  if curl -kfsS --noproxy '*' --max-time 2 -H "Host: ${PANEL_DOMAIN}:${PANEL_PORT}" "https://127.0.0.1:${PANEL_PORT}/" -o /dev/null; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+(( ready == 1 )) || { printf 'Panel did not become ready on 127.0.0.1:%s.\n' "$PANEL_PORT" >&2; exit 1; }
 APPLIED=0
 printf 'Hysteria Control updated to %s. Users and server configuration were kept.\n' "$(tr -d '\n' < "$INSTALL_DIR/VERSION")"
