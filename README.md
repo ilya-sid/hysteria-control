@@ -72,7 +72,7 @@ The updater downloads the latest panel code, version file, and bundled IBM Plex 
 
 ## Routing and traffic charts
 
-The panel shows cumulative traffic per user in a doughnut chart and a bar chart. Users can be sorted by name or total traffic. The top-right settings icon opens theme, language, and admin password controls. Light mode uses a solid Cloud Dancer background and Cool Blue accents; dark mode uses a black background and Persimmon accents.
+The panel shows cumulative traffic per user in a doughnut chart and a bar chart. Users can be sorted by name or total traffic. The top-right settings icon opens theme, language, and admin password controls. The theme can also follow the device's system setting automatically. Light mode uses a solid Cloud Dancer background and Cool Blue accents; dark mode uses a black background and Persimmon accents.
 
 Site routing is enabled in exported **sing-box JSON profiles**. Russian domains and IP ranges are routed directly by default, while other traffic uses Hysteria. The panel includes `.ru` and `.рф` suffixes plus the [SagerNet Russian domain](https://github.com/SagerNet/sing-geosite) and [Russian IP](https://github.com/SagerNet/sing-geoip) rule sets. In the Site routing section, add a domain, individual IP, or CIDR range and choose Direct or Through VPN. A custom Through VPN rule takes priority over the default Russian bypass. Download a new sing-box profile for each user after changing routing rules, then import the new profile in the client. The remote Russian rule sets are fetched and cached by sing-box on the client device.
 
