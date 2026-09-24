@@ -52,6 +52,8 @@ systemctl is-active --quiet hysteria-control.service
 set -a
 . "$CONFIG"
 set +a
-curl -fsS --noproxy '*' --max-time 5 --resolve "${PANEL_DOMAIN}:${PANEL_PORT}:127.0.0.1" "https://${PANEL_DOMAIN}:${PANEL_PORT}/" -o /dev/null
+# Проверяем локальный listener напрямую: DNS и внешний прокси не должны влиять
+# на обновление, а Host нужен приложению для обычной маршрутизации запроса.
+curl -kfsS --noproxy '*' --max-time 5 -H "Host: ${PANEL_DOMAIN}:${PANEL_PORT}" "https://127.0.0.1:${PANEL_PORT}/" -o /dev/null
 APPLIED=0
 printf 'Hysteria Control updated to %s. Users and server configuration were kept.\n' "$(tr -d '\n' < "$INSTALL_DIR/VERSION")"
