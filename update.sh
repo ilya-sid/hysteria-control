@@ -52,11 +52,12 @@ systemctl is-active --quiet hysteria-control.service
 set -a
 . "$CONFIG"
 set +a
-# Ждём готовности Flask после перезапуска: systemd может пометить сервис
-# активным за несколько секунд до открытия HTTPS-порта.
+# Ждём открытия порта после перезапуска: systemd может пометить сервис
+# активным за несколько секунд до готовности listener. Проверка TCP не
+# зависит от DNS, прокси, сертификата и HTTP-редиректов панели.
 ready=0
 for _ in $(seq 1 20); do
-  if curl -kfsS --noproxy '*' --max-time 2 -H "Host: ${PANEL_DOMAIN}:${PANEL_PORT}" "https://127.0.0.1:${PANEL_PORT}/" -o /dev/null; then
+  if ss -H -lnt "sport = :${PANEL_PORT}" 2>/dev/null | grep -q "LISTEN"; then
     ready=1
     break
   fi
