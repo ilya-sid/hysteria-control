@@ -72,7 +72,7 @@ The updater downloads the latest panel code, version file, and bundled IBM Plex 
 
 ## Traffic charts and appearance
 
-The panel shows cumulative traffic per user in a doughnut chart and a bar chart. Users can be sorted by name or total traffic. The top-right settings icon opens theme, language, and admin password controls. The theme can also follow the device's system setting automatically. Light mode uses a solid Cloud Dancer background and Cool Blue accents; dark mode uses a black background and Persimmon accents.
+The panel shows cumulative traffic per user in a doughnut chart and a bar chart. Each bar is labeled with the user's incoming traffic; users can be sorted by name or total traffic. The top-right settings icon opens theme, language, and admin password controls. The theme can also follow the device's system setting automatically. Light mode uses a solid Cloud Dancer background and Cool Blue accents; dark mode uses a black background and Persimmon accents.
 
 ## Development checks
 
