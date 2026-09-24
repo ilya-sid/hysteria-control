@@ -2,7 +2,7 @@
 
 [Русская версия](README.ru.md)
 
-A lightweight, self-hosted Hysteria 2 server and web panel for managing users, connection links, QR codes, traffic, server health, and client routing. The panel is a small Flask app with SQLite; there is no Docker, Nginx, PostgreSQL, or separate frontend build. The interface supports English and Russian, with self-hosted IBM Plex fonts.
+A lightweight, self-hosted Hysteria 2 server and web panel for managing users, connection links, QR codes, traffic, and server health. The panel is a small Flask app with SQLite; there is no Docker, Nginx, PostgreSQL, or separate frontend build. The interface supports English and Russian, with self-hosted IBM Plex fonts.
 
 ## One-command installation
 
@@ -70,13 +70,9 @@ sudo bash -c 'set -o pipefail; curl -fsSL https://raw.githubusercontent.com/ilya
 
 The updater downloads the latest panel code, version file, and bundled IBM Plex fonts, checks the code, restarts the panel, and verifies its HTTPS response. It keeps the user database, VPN credentials, TLS certificate, Hysteria service, and server settings. If the panel fails to restart, it restores the previous panel files. It does not ask questions or upgrade Hysteria itself.
 
-## Routing and traffic charts
+## Traffic charts and appearance
 
 The panel shows cumulative traffic per user in a doughnut chart and a bar chart. Users can be sorted by name or total traffic. The top-right settings icon opens theme, language, and admin password controls. The theme can also follow the device's system setting automatically. Light mode uses a solid Cloud Dancer background and Cool Blue accents; dark mode uses a black background and Persimmon accents.
-
-Site routing is enabled in exported **sing-box JSON profiles**. Russian domains and IP ranges are routed directly by default, while other traffic uses Hysteria. The panel includes `.ru` and `.рф` suffixes plus the [SagerNet Russian domain](https://github.com/SagerNet/sing-geosite) and [Russian IP](https://github.com/SagerNet/sing-geoip) rule sets. In the Site routing section, add a domain, individual IP, or CIDR range and choose Direct or Through VPN. A custom Through VPN rule takes priority over the default Russian bypass. Download a new sing-box profile for each user after changing routing rules, then import the new profile in the client. The remote Russian rule sets are fetched and cached by sing-box on the client device.
-
-The Site routing section also offers an [INCY routing profile](https://docs.incy.cc/en/routing/) as a JSON download or one-tap `incy://` import link. The recommended `incy://autorouting/` link sets up automatic updates: INCY fetches the rules from an HTTPS URL with an unguessable token. The URL contains routing rules only, not VPN credentials. Import this profile in INCY alongside the existing Hysteria connection; the connection itself does not need to change. The ordinary `incy://routing/` link is a one-time import and must be imported again after rule changes. Ordinary `hysteria2://` links and their QR codes contain connection details only: they cannot carry site routing rules. v2rayTun and other clients will not automatically inherit the panel's rules from a Hysteria link; configure equivalent split tunneling there, or use the exported sing-box profile in a compatible client. A client may still resolve or connect to a site in ways that do not expose the domain to routing rules; for strict behavior, verify the route on the device.
 
 ## Development checks
 

@@ -1,4 +1,4 @@
-import os, sqlite3, secrets, subprocess, re, json, urllib.request, urllib.parse, sys, hashlib, base64, grp, time, ipaddress
+import os, sqlite3, secrets, subprocess, re, json, urllib.request, urllib.parse, sys, hashlib, base64, grp, time
 from flask import Flask, request, session, redirect, abort, make_response, Response, send_from_directory
 
 APP_DIR=os.environ.get('HY_CONTROL_DIR','/opt/hysteria-control')
@@ -22,29 +22,12 @@ def conn():
         c.execute('create table if not exists users(username text primary key,password text not null,enabled integer not null default 1)')
         c.execute('create table if not exists usage(username text primary key,tx integer not null default 0,rx integer not null default 0,last_tx integer not null default 0,last_rx integer not null default 0)')
         c.execute('create table if not exists settings(key text primary key,value text not null)')
-        c.execute('create table if not exists route_exceptions(id integer primary key autoincrement,kind text not null,value text not null unique,created_at integer not null,action text not null default "direct")')
-        if 'action' not in [column[1] for column in c.execute('pragma table_info(route_exceptions)')]:
-            try: c.execute('alter table route_exceptions add column action text not null default "direct"')
-            except sqlite3.OperationalError as exc:
-                if 'duplicate column' not in str(exc).lower(): raise
         c.commit(); db_ready=True
     return c
 def setting(key,default=''):
     c=conn(); r=c.execute('select value from settings where key=?',(key,)).fetchone(); c.close(); return r['value'] if r else default
 def put_setting(key,value):
     c=conn(); c.execute('insert into settings values(?,?) on conflict(key) do update set value=excluded.value',(key,value)); c.commit(); c.close()
-def routing_revision():
-    value=setting('routing_revision')
-    if not value:
-        value=str(int(time.time())); put_setting('routing_revision',value)
-    return int(value)
-def bump_routing_revision():
-    put_setting('routing_revision',str(max(int(time.time()),routing_revision()+1)))
-def routing_token():
-    value=setting('routing_token')
-    if not value:
-        value=secrets.token_urlsafe(24); put_setting('routing_token',value)
-    return value
 def hash_password(password):
     salt=secrets.token_bytes(16); rounds=310000
     digest=hashlib.pbkdf2_hmac('sha256',password.encode(),salt,rounds)
@@ -129,8 +112,7 @@ a{color:inherit;text-decoration:none}button,input,select{font:inherit}button{bor
 const LANG='__LANG__',T={"Работает":"Online","Остановлена":"Stopped","Не в сети":"Offline","Активно":"Active","Сверяем соединение…":"Checking connection…","Панель управления сервером":"Server control panel","Личный сервер":"Private server","Вход в панель":"Sign in","Управление сервером и доступом пользователей":"Manage your server and user access","Логин":"Username","Пароль":"Password","Войти":"Sign in","Неверный логин или пароль":"Incorrect username or password","Обзор сервера":"Server overview","Состояние узла и активность подключений":"Node status and connection activity","обновление каждые 15 сек":"refresh every 15 sec","Нагрузка на процессор":"CPU usage","текущая загрузка CPU":"current CPU usage","Оперативная память":"Memory","Swap":"Swap","Диск":"Disk","Hysteria2":"Hysteria2","Сохранить SNI":"Save SNI","Пользователи":"Users","Индивидуальные подключения и их трафик":"User connections and traffic","всего":"total","Имя нового пользователя":"New username","＋ Добавить пользователя":"＋ Add user","Пока нет пользователей. Добавьте первого выше.":"No users yet. Add the first one above.","Включён":"Enabled","Отключён":"Disabled","Скачать":"Download","Скачано":"Downloaded","Загружено":"Uploaded","Входящий":"Incoming","Исходящий":"Outgoing","QR-код":"QR code","Копировать":"Copy","Отключить":"Disable","Включить":"Enable","Удалить":"Delete","Индикатор показывает текущую сессию Hysteria2. Трафик — накопительно с момента добавления пользователя.":"The indicator shows the current Hysteria2 session. Traffic is cumulative since the user was added.","Смена пароля":"Change password","Введите текущий и новый пароль.":"Enter your current and new password.","Текущий пароль":"Current password","Новый пароль (от 12 символов)":"New password (12+ characters)","Повторите новый пароль":"Confirm new password","Сменить пароль":"Change password","Тема":"Theme","Язык":"Language","Светлая":"Light","Тёмная":"Dark","Русский":"Russian","Английский":"English","Настройки":"Settings","Маршрутизация сайтов":"Site routing","Российские сайты напрямую":"Route Russian sites directly","Включает обход VPN для доменов из списка geosite-ru. Правило действует в экспортируемом профиле sing-box.":"Bypass VPN for domains in the Russian geosite list. This applies to the exported sing-box profile.","Сохранить":"Save","Быстрое исключение":"Quick bypass exception","Добавить домен или IP":"Add domain or IP","Добавить":"Add","Домены и IP, направляемые напрямую":"Domains and IPs routed directly","Пока исключений нет":"No exceptions yet","Статистика трафика пользователей":"User traffic statistics","Доли трафика":"Traffic share","Трафик по пользователям":"Traffic by user","Сортировать":"Sort by","По имени":"Name","По трафику":"Traffic","по возрастанию":"Ascending","по убыванию":"Descending","Получить профиль sing-box":"Get sing-box profile","Обычная Hysteria-ссылка не содержит маршрутизацию. Для правил используйте профиль sing-box.":"A regular Hysteria link does not contain routing rules. Use a sing-box profile to apply these rules.","Правила применяются на устройстве клиента":"Rules are applied on the client device","Профиль включает российские домены и ваши исключения напрямую; остальной трафик идёт через Hysteria.":"The profile routes Russian domains and your exceptions directly; other traffic goes through Hysteria.","Уже существует":"Already exists","Скопировано":"Copied","Переход на главную":"Back to panel","Обновить SNI":"Save SNI"};
 Object.assign(T,{"Выйти":"Sign out","Проверяем сервер":"Checking server","Накопленные данные по всем подключениям":"Cumulative data for all connections","Включает обход VPN для доменов и IP России. Правило действует в экспортируемом профиле sing-box.":"Bypass VPN for Russian domains and IPs in the exported sing-box profile.","Неверный домен или IP":"Invalid domain or IP","Назад":"Back","Текущий пароль неверен":"Current password is incorrect","Пароль должен содержать от 12 до 256 символов":"Password must be 12–256 characters","Новые пароли не совпадают":"New passwords do not match","Пароль изменён":"Password changed","Войдите снова с новым паролем.":"Sign in with your new password.","Перейти ко входу":"Go to sign in","Форма устарела":"Form expired","Обновите страницу и добавьте пользователя ещё раз.":"Refresh the page and add the user again.","Вернуться в панель":"Back to panel","Неверное имя пользователя":"Invalid username","Используйте 1–32 латинские буквы, цифры, _ или -.":"Use 1–32 Latin letters, digits, _ or -.","Пользователь уже существует":"User already exists","Выберите другое имя.":"Choose another name.","Нужен хотя бы один активный пользователь":"At least one active user is required","SNI должен совпадать с доменом TLS-сертификата:":"SNI must match the TLS certificate domain:"});
 Object.assign(T,{"Направление":"Route","Напрямую":"Direct","Через VPN":"Through VPN","Домен или IP можно направить напрямую или через VPN":"Route a domain or IP directly or through the VPN"});
-Object.assign(T,{"Профили для клиентов":"Client profiles","После изменения правил импортируйте их в используемое приложение. Подключение Hysteria менять не нужно.":"Import changed rules into your client app. Your Hysteria connection can stay as it is.","Применить правила в Incy":"Apply rules in Incy","Скачать правила Incy":"Download Incy rules"});
-Object.assign(T,{"Подключение Hysteria менять не нужно. Incy может получать изменённые правила автоматически.":"Your Hysteria connection can stay as it is. Incy can refresh changed rules automatically.","Автообновление правил Incy":"Auto-update Incy rules","Как в системе":"System","Профиль sing-box":"sing-box profile"});
+Object.assign(T,{"Как в системе":"System"});
 function translate(){if(LANG!=='en')return;let w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT),n=[];while(n=w.nextNode()){let k=n.nodeValue.trim();if(T[k])n.nodeValue=n.nodeValue.replace(k,T[k])}document.querySelectorAll('input[placeholder]').forEach(e=>{if(T[e.placeholder])e.placeholder=T[e.placeholder]});document.querySelectorAll('[aria-label]').forEach(e=>{if(T[e.getAttribute('aria-label')])e.setAttribute('aria-label',T[e.getAttribute('aria-label')])});document.querySelectorAll('[title]').forEach(e=>{if(T[e.title])e.title=T[e.title]})}translate();
 const themeBtn=document.getElementById('themeToggle');if(themeBtn)themeBtn.onclick=()=>{let v=document.body.classList.contains('light')?'dark':'light';document.cookie='theme='+v+';path=/;max-age=31536000';location.reload()};
 const gear=document.getElementById('gearToggle'),settings=document.getElementById('settingsPanel');if(gear&&settings){gear.onclick=()=>settings.hidden=!settings.hidden;document.addEventListener('click',e=>{if(!e.target.closest('.gear-menu'))settings.hidden=true})}const langSel=document.getElementById('languageSelect');if(langSel){langSel.value=LANG;langSel.onchange=()=>{document.cookie='language='+langSel.value+';path=/;max-age=31536000';location.reload()}}const themeSel=document.getElementById('themeSelect');if(themeSel){let savedTheme=document.cookie.match(/(?:^|; )theme=([^;]+)/)?.[1]||'system';themeSel.value=['system','light','dark'].includes(savedTheme)?savedTheme:'system';themeSel.onchange=()=>{document.cookie='theme='+themeSel.value+';path=/;max-age=31536000';location.reload()}};
@@ -169,10 +151,8 @@ def home():
             session['ok']=True; session['auth_version']=auth_version(); return redirect('/')
         return page(LOGIN.replace('Личный сервер','Неверный логин или пароль'))
     if not logged(): return page(LOGIN)
-    c=conn(); users=c.execute('select username,password,enabled from users order by username').fetchall(); exceptions=c.execute('select id,kind,value,action from route_exceptions order by value').fetchall(); c.close()
+    c=conn(); users=c.execute('select username,password,enabled from users order by username').fetchall(); c.close()
     sni=setting('sni',DOMAIN); tok=csrf()
-    incy_link='incy://routing/onadd/'+urllib.parse.quote(base64.b64encode(json.dumps(incy_routing_profile(),ensure_ascii=False,separators=(',',':')).encode()).decode(),safe='')
-    incy_auto='incy://autorouting/onadd/'+urllib.parse.quote(f'https://{DOMAIN}:{PANEL_PORT}/routing/incy/{routing_token()}.json',safe=':/')
     selected='en' if request.cookies.get('language')=='en' else 'ru'
     theme=request.cookies.get('theme','system')
     if theme not in ('system','light','dark'): theme='system'
@@ -183,12 +163,7 @@ def home():
 <section class="card server-card"><div class=server-row><div class=server-info><span class=lamp id=serviceLamp2></span><div><h3>Hysteria2</h3><p>UDP/443 · {DOMAIN}</p></div></div><form method=post action=/sni><input type=hidden name=csrf value="{tok}"><div class=sni-row><input name=sni value="{sni}" aria-label="SNI"><button class=small>Сохранить SNI</button></div></form></div></section>
 <div class=section-head><div><h3>Статистика трафика пользователей</h3><p>Накопленные данные по всем подключениям</p></div></div>
 <div class=chart-grid><section class="card chart-box"><h4>Доли трафика</h4><div class=donut-wrap><div class=donut id=trafficDonut role=img aria-label="Доли трафика"></div><div class=legend id=trafficLegend>—</div></div></section><section class="card chart-box"><h4>Трафик по пользователям</h4><div class=bars id=trafficBars></div></section></div>
-<div class=section-head><div><h3>Маршрутизация сайтов</h3><p>Правила применяются на устройстве клиента</p></div></div>
-<div class=route-grid><section class=card><h4 style="margin:0 0 8px">Российские сайты напрямую</h4><p class=muted>Включает обход VPN для доменов и IP России. Правило действует в экспортируемом профиле sing-box.</p><form method=post action=/routing/settings class="form-row route-setting-form"><input type=hidden name=csrf value="{tok}"><label class=route-setting><input type=checkbox name=bypass_ru value=1 {'checked' if setting('bypass_ru','1')=='1' else ''}><span>Российские сайты напрямую</span></label><button class=small>Сохранить</button></form><p class=footer-note>Обычная Hysteria-ссылка не содержит маршрутизацию. Для правил используйте профиль sing-box.</p></section><section class=card><h4 style="margin:0 0 8px">Быстрое исключение</h4><p class=muted>Домен или IP можно направить напрямую или через VPN</p><form method=post action=/routing/add class=route-form><input type=hidden name=csrf value="{tok}"><input name=value placeholder="Добавить домен или IP" maxlength=253 required><select name=action aria-label="Направление"><option value=direct>Напрямую</option><option value=proxy>Через VPN</option></select><button class=primary>Добавить</button></form><div class=route-list>'''
-    if not exceptions: body+='<div class=muted>Пока исключений нет</div>'
-    for item in exceptions:
-        body+=f'''<div class=route-item><span>{item['value']}</span><span class=pill>{'Через VPN' if item['action']=='proxy' else 'Напрямую'}</span><form method=post action=/routing/delete><input type=hidden name=csrf value="{tok}"><input type=hidden name=id value="{item['id']}"><button class="small danger" aria-label="Удалить">×</button></form></div>'''
-    body+=f'''</div></section></div><div class="card" style="margin-top:14px"><h4 style="margin:0 0 7px">Профили для клиентов</h4><p class=muted style="margin:0 0 13px">Подключение Hysteria менять не нужно. Incy может получать изменённые правила автоматически.</p><div class=form-row><a href="{incy_auto}"><button type=button class=primary>Автообновление правил Incy</button></a><a href="{incy_link}"><button type=button>Применить правила в Incy</button></a><a href=/routing/incy.json download><button type=button>Скачать правила Incy</button></a></div></div>'''
+'''
     body+=f'''<div class=section-head><div><h3>Пользователи</h3><p>Индивидуальные подключения и их трафик</p></div><div class=sort-tools><select id=sortBy aria-label="Сортировать"><option value=name>По имени</option><option value=traffic>По трафику</option></select><span class=pill>{len(users)} <span>всего</span></span></div></div>
 <section class=card><form class=form-row method=post action=/add><input type=hidden name=csrf value="{tok}"><input name=u placeholder="Имя нового пользователя" pattern="[A-Za-z0-9_-]{{1,32}}" maxlength=32 required><button class=primary>＋ Добавить пользователя</button></form><div id=userList style="margin-top:14px">'''
     if not users: body+='<div class=empty>Пока нет пользователей. Добавьте первого выше.</div>'
@@ -196,7 +171,7 @@ def home():
         name=u['username']; uri=f'hysteria2://{name}:{u["password"]}@{DOMAIN}:443/?sni={sni}&insecure=0#{name}'
         state='Включён' if u['enabled'] else 'Отключён'
         qrurl='/qr/'+urllib.parse.quote(name,safe='')
-        body+=f'''<div class=client data-user="{name}"><div><div class=client-name><span class="lamp userlamp {'off' if not u['enabled'] else ''}"></span>{name}<span class=pill>{state}</span></div><div class=client-meta data-online>Сверяем соединение…</div></div><div class=traffic><span>Входящий:</span> <b data-traffic=rx>—</b><br><span>Исходящий:</span> <b data-traffic=tx>—</b></div><div class=actions><button type=button class=small onclick="qr(this)" data-qr="{qrurl}">QR-код</button><button type=button class=small onclick="copyLink(this)" data-link="{uri}">Копировать</button><a class=action-link href="/client/{urllib.parse.quote(name,safe='')}.json" download>Профиль sing-box</a><form method=post action=/toggle><input type=hidden name=csrf value="{tok}"><input type=hidden name=u value="{name}"><button class="small">{'Отключить' if u['enabled'] else 'Включить'}</button></form><form method=post action=/delete onsubmit="return confirm('Удалить пользователя {name}?')"><input type=hidden name=csrf value="{tok}"><input type=hidden name=u value="{name}"><button class="small danger">Удалить</button></form></div><div class=client-lower><div class=link>{uri}</div><div class=qr-wrap><img class=qr alt="QR код подключения"></div></div></div>'''
+        body+=f'''<div class=client data-user="{name}"><div><div class=client-name><span class="lamp userlamp {'off' if not u['enabled'] else ''}"></span>{name}<span class=pill>{state}</span></div><div class=client-meta data-online>Сверяем соединение…</div></div><div class=traffic><span>Входящий:</span> <b data-traffic=rx>—</b><br><span>Исходящий:</span> <b data-traffic=tx>—</b></div><div class=actions><button type=button class=small onclick="qr(this)" data-qr="{qrurl}">QR-код</button><button type=button class=small onclick="copyLink(this)" data-link="{uri}">Копировать</button><form method=post action=/toggle><input type=hidden name=csrf value="{tok}"><input type=hidden name=u value="{name}"><button class="small">{'Отключить' if u['enabled'] else 'Включить'}</button></form><form method=post action=/delete onsubmit="return confirm('Удалить пользователя {name}?')"><input type=hidden name=csrf value="{tok}"><input type=hidden name=u value="{name}"><button class="small danger">Удалить</button></form></div><div class=client-lower><div class=link>{uri}</div><div class=qr-wrap><img class=qr alt="QR код подключения"></div></div></div>'''
     body+='''</div></section><div class=footer-note>Индикатор показывает текущую сессию Hysteria2. Трафик — накопительно с момента добавления пользователя.</div>'''
     return page(body)
 
@@ -260,105 +235,6 @@ def sni():
     check(); value=request.form.get('sni','').strip().lower()
     if value!=DOMAIN: return page('<div class="card">SNI должен совпадать с доменом TLS-сертификата: '+DOMAIN+'.</div><a href="/"><button>Назад</button></a>')
     put_setting('sni',value); return redirect('/')
-
-@app.post('/routing/settings')
-def routing_settings():
-    if not logged(): abort(403)
-    check()
-    put_setting('bypass_ru','1' if request.form.get('bypass_ru')=='1' else '0')
-    bump_routing_revision()
-    return redirect('/')
-
-def route_target(raw):
-    value=raw.strip().lower()
-    if value.startswith('*.'): value=value[2:]
-    try:
-        network=ipaddress.ip_network(value,strict=False)
-        return 'ip',str(network)
-    except ValueError: pass
-    try: value=value.encode('idna').decode('ascii')
-    except UnicodeError: raise ValueError('Invalid domain')
-    if len(value)>253 or '.' not in value or value.rsplit('.',1)[1].isdigit() or not all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?',label) for label in value.split('.')):
-        raise ValueError('Invalid domain or IP address')
-    return 'domain',value
-
-def incy_routing_profile():
-    c=conn(); rows=c.execute('select kind,value,action from route_exceptions order by value').fetchall(); c.close()
-    direct_sites=['domain:'+x['value'] for x in rows if x['kind']=='domain' and x['action']=='direct']
-    direct_ips=[x['value'] for x in rows if x['kind']=='ip' and x['action']=='direct']
-    proxy_sites=['domain:'+x['value'] for x in rows if x['kind']=='domain' and x['action']=='proxy']
-    proxy_ips=[x['value'] for x in rows if x['kind']=='ip' and x['action']=='proxy']
-    if setting('bypass_ru','1')=='1':
-        direct_sites.extend(['geosite:ru',r'regexp:\.(ru|xn--p1ai)$'])
-        direct_ips.append('geoip:ru')
-    return {'Name':'Hysteria Control','GlobalProxy':'true','LastUpdated':str(routing_revision()),
-            'DirectSites':direct_sites,'DirectIp':direct_ips,'ProxySites':proxy_sites,'ProxyIp':proxy_ips,
-            'BlockSites':[],'BlockIp':[],'DomainStrategy':'IPIfNonMatch','FakeDNS':'false','useChunkFiles':True}
-
-@app.post('/routing/add')
-def routing_add():
-    if not logged(): abort(403)
-    check()
-    try: kind,value=route_target(request.form.get('value',''))
-    except ValueError: return page('<div class="card login"><h2>Неверный домен или IP</h2><a href="/"><button>Назад</button></a></div>'),400
-    action=request.form.get('action','direct')
-    if action not in ('direct','proxy'): abort(400)
-    c=conn()
-    c.execute('insert into route_exceptions(kind,value,created_at,action) values(?,?,?,?) on conflict(value) do update set action=excluded.action',(kind,value,int(time.time()),action))
-    c.commit(); c.close(); bump_routing_revision()
-    return redirect('/')
-
-@app.post('/routing/delete')
-def routing_delete():
-    if not logged(): abort(403)
-    check()
-    c=conn(); c.execute('delete from route_exceptions where id=?',(request.form.get('id',''),)); c.commit(); c.close(); bump_routing_revision()
-    return redirect('/')
-
-@app.get('/routing/incy.json')
-def incy_profile():
-    if not logged(): abort(403)
-    payload=json.dumps(incy_routing_profile(),ensure_ascii=False,indent=2)+'\n'
-    return Response(payload,mimetype='application/json',headers={'Content-Disposition':'attachment; filename="hysteria-control-incy-routing.json"','Cache-Control':'no-store'})
-
-@app.get('/routing/incy/<token>.json')
-def incy_auto_profile(token):
-    expected=setting('routing_token')
-    if not expected or not secrets.compare_digest(token,expected): abort(404)
-    payload=json.dumps(incy_routing_profile(),ensure_ascii=False,indent=2)+'\n'
-    return Response(payload,mimetype='application/json',headers={'Cache-Control':'no-store'})
-
-@app.get('/client/<username>.json')
-def client_profile(username):
-    if not logged(): abort(403)
-    c=conn(); user=c.execute('select username,password from users where username=?',(username,)).fetchone()
-    exceptions=c.execute('select kind,value,action from route_exceptions order by value').fetchall(); c.close()
-    if not user: abort(404)
-    proxy_domains=[x['value'] for x in exceptions if x['kind']=='domain' and x['action']=='proxy']
-    proxy_ips=[x['value'] for x in exceptions if x['kind']=='ip' and x['action']=='proxy']
-    domains=[x['value'] for x in exceptions if x['kind']=='domain' and x['action']=='direct']
-    ips=[x['value'] for x in exceptions if x['kind']=='ip' and x['action']=='direct']
-    rules=[{'action':'sniff'}]
-    if proxy_domains: rules.append({'domain_suffix':proxy_domains,'action':'route','outbound':'proxy'})
-    if proxy_ips: rules.append({'ip_cidr':proxy_ips,'action':'route','outbound':'proxy'})
-    if domains: rules.append({'domain_suffix':domains,'action':'route','outbound':'direct'})
-    if ips: rules.append({'ip_cidr':ips,'action':'route','outbound':'direct'})
-    rule_sets=[]
-    if setting('bypass_ru','1')=='1':
-        rules.append({'domain_suffix':['.ru','.xn--p1ai'],'action':'route','outbound':'direct'})
-        rules.append({'rule_set':['ru-domains','ru-ips'],'action':'route','outbound':'direct'})
-        rule_sets.append({'type':'remote','tag':'ru-domains','format':'binary','url':'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs','download_detour':'proxy'})
-        rule_sets.append({'type':'remote','tag':'ru-ips','format':'binary','url':'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs','download_detour':'proxy'})
-    profile={
-        'log':{'level':'warn'},
-        'dns':{'servers':[{'type':'local','tag':'local'}],'final':'local','strategy':'prefer_ipv4','reverse_mapping':True},
-        'inbounds':[{'type':'tun','tag':'tun-in','address':['172.19.0.1/30'],'auto_route':True,'strict_route':True,'stack':'system'}],
-        'outbounds':[{'type':'hysteria2','tag':'proxy','server':DOMAIN,'server_port':443,'password':user['username']+':'+user['password'],'tls':{'enabled':True,'server_name':setting('sni',DOMAIN)}},{'type':'direct','tag':'direct'}],
-        'route':{'auto_detect_interface':True,'rules':rules,'rule_set':rule_sets,'final':'proxy'},
-        'experimental':{'cache_file':{'enabled':True}}
-    }
-    payload=json.dumps(profile,ensure_ascii=False,indent=2)+'\n'
-    return Response(payload,mimetype='application/json',headers={'Content-Disposition':f'attachment; filename="hysteria-control-{username}.json"','Cache-Control':'no-store'})
 
 @app.get('/fonts/<path:filename>')
 def fonts(filename):
