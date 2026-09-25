@@ -59,7 +59,10 @@ sudo bash -c 'set -o pipefail; curl -fsSL https://raw.githubusercontent.com/ilya
 ```sh
 bash -n install.sh
 python3 -m py_compile app.py
+python3 -m unittest discover -s tests -v
 ```
+
+Для проверки TLS нужны Flask и OpenSSL. Тест подтверждает, что зависшее подключение одного клиента не блокирует страницу входа для остальных.
 
 ## Лицензия
 

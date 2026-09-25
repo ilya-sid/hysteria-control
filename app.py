@@ -1,5 +1,6 @@
-import os, sqlite3, secrets, subprocess, re, json, urllib.request, urllib.parse, sys, hashlib, base64, grp, time
+import os, sqlite3, secrets, subprocess, re, json, urllib.request, urllib.parse, sys, hashlib, base64, grp, time, ssl, threading
 from flask import Flask, request, session, redirect, abort, make_response, Response, send_from_directory
+from werkzeug.serving import ThreadedWSGIServer
 
 APP_DIR=os.environ.get('HY_CONTROL_DIR','/opt/hysteria-control')
 DB=os.environ.get('PANEL_DB',os.path.join(APP_DIR,'panel.db'))
@@ -284,8 +285,52 @@ def metrics():
     return data
 @app.get('/logout')
 def logout(): session.clear(); return redirect('/')
+
+class PanelServer(ThreadedWSGIServer):
+    """Keep a slow TLS handshake from blocking the listening socket."""
+    daemon_threads=True
+    max_connections=32
+
+    def __init__(self):
+        context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(PANEL_CERT,PANEL_KEY)
+        # Werkzeug normally wraps the listening socket. Its accept loop then
+        # waits for each TLS handshake before it can accept another client.
+        super().__init__('0.0.0.0',PANEL_PORT,app)
+        self.ssl_context=context
+        self.connections=threading.BoundedSemaphore(self.max_connections)
+
+    def process_request(self,request,client_address):
+        if not self.connections.acquire(blocking=False):
+            request.close()
+            return
+        try:
+            super().process_request(request,client_address)
+        except BaseException:
+            request.close()
+            self.connections.release()
+            raise
+
+    def process_request_thread(self,request,client_address):
+        secure=None
+        try:
+            request.settimeout(5)
+            secure=self.ssl_context.wrap_socket(request,server_side=True)
+            secure.settimeout(30)
+            self.finish_request(secure,client_address)
+        except OSError:
+            # A client can disconnect during the handshake or response.
+            pass
+        except Exception:
+            self.handle_error(request,client_address)
+        finally:
+            self.shutdown_request(secure if secure is not None else request)
+            self.connections.release()
+
 if __name__=='__main__':
     if sys.argv[1:]==['--sync-root']:
         write_server_config()
     else:
-        app.run(host='0.0.0.0',port=PANEL_PORT,ssl_context=(PANEL_CERT,PANEL_KEY))
+        server=PanelServer()
+        try: server.serve_forever()
+        finally: server.server_close()

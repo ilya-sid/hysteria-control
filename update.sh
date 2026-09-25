@@ -52,17 +52,18 @@ systemctl is-active --quiet hysteria-control.service
 set -a
 . "$CONFIG"
 set +a
-# Ждём открытия порта после перезапуска: systemd может пометить сервис
-# активным за несколько секунд до готовности listener. Проверка TCP не
-# зависит от DNS, прокси, сертификата и HTTP-редиректов панели.
+# The listener can accept TCP while its TLS handshake is stuck. Check an
+# actual HTTPS response through loopback, bypassing DNS and proxy settings.
 ready=0
 for _ in $(seq 1 20); do
-  if ss -H -lnt "sport = :${PANEL_PORT}" 2>/dev/null | grep -q "LISTEN"; then
+  if curl -fs --noproxy '*' --connect-timeout 1 --max-time 3 \
+    --resolve "${PANEL_DOMAIN}:${PANEL_PORT}:127.0.0.1" \
+    "https://${PANEL_DOMAIN}:${PANEL_PORT}/" -o /dev/null; then
     ready=1
     break
   fi
   sleep 1
 done
-(( ready == 1 )) || { printf 'Panel did not become ready on 127.0.0.1:%s.\n' "$PANEL_PORT" >&2; exit 1; }
+(( ready == 1 )) || { printf 'Panel did not respond over HTTPS on 127.0.0.1:%s.\n' "$PANEL_PORT" >&2; exit 1; }
 APPLIED=0
 printf 'Hysteria Control updated to %s. Users and server configuration were kept.\n' "$(tr -d '\n' < "$INSTALL_DIR/VERSION")"

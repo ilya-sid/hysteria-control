@@ -79,7 +79,10 @@ The panel shows cumulative traffic per user in a doughnut chart and a bar chart.
 ```sh
 bash -n install.sh
 python3 -m py_compile app.py
+python3 -m unittest discover -s tests -v
 ```
+
+The TLS regression test requires Flask and OpenSSL. It verifies that a stalled client handshake cannot block the panel's login page.
 
 ## License
 
