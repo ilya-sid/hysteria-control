@@ -134,6 +134,8 @@ PANEL_DB=/var/lib/hysteria-control/panel.db
 HYSTERIA_API=http://127.0.0.1:9999
 HYSTERIA_API_SECRET_FILE=/etc/hysteria/api-secret
 HYSTERIA_CONFIG=/etc/hysteria/config.yaml
+HYSTERIA_DYNAMIC_AUTH=1
+HYSTERIA_AUTH_PORT=9998
 PANEL_CERT=${CONFIG_DIR}/tls/fullchain.pem
 PANEL_KEY=${CONFIG_DIR}/tls/privkey.pem
 EOF
@@ -146,9 +148,9 @@ tls:
   cert: ${CONFIG_DIR}/tls/fullchain.pem
   key: ${CONFIG_DIR}/tls/privkey.pem
 auth:
-  type: userpass
-  userpass:
-    primary: ${PRIMARY_PASS}
+  type: http
+  http:
+    url: http://127.0.0.1:9998/auth
 trafficStats:
   listen: 127.0.0.1:9999
   secret: ${API_SECRET}
@@ -190,7 +192,8 @@ visudo -cf /etc/sudoers.d/hysteria-control
 cat > /etc/systemd/system/hysteria-control.service <<'EOF'
 [Unit]
 Description=Hysteria Control web panel
-After=network-online.target hysteria-server.service
+After=network-online.target
+Before=hysteria-server.service
 Wants=network-online.target
 
 [Service]
@@ -223,9 +226,9 @@ chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/hysteria-control
 
 python3 -m py_compile "$INSTALL_DIR/app.py"
 systemctl daemon-reload
-systemctl enable --now hysteria-server.service
-systemctl restart hysteria-server.service
 systemctl enable --now hysteria-control.service
+systemctl enable hysteria-server.service
+systemctl restart hysteria-server.service
 systemctl enable --now certbot.timer
 systemctl is-active --quiet hysteria-server.service || die 'Hysteria did not start. Check journalctl -u hysteria-server.service.'
 systemctl is-active --quiet hysteria-control.service || die 'The panel did not start. Check journalctl -u hysteria-control.service.'

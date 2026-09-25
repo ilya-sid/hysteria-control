@@ -1,4 +1,5 @@
 import os, sqlite3, secrets, subprocess, re, json, urllib.request, urllib.parse, sys, hashlib, base64, grp, time, ssl, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from flask import Flask, request, session, redirect, abort, make_response, Response, send_from_directory
 from werkzeug.serving import ThreadedWSGIServer
 
@@ -11,21 +12,27 @@ HY2_CONFIG=os.environ.get('HYSTERIA_CONFIG','/etc/hysteria/config.yaml')
 PANEL_CERT=os.environ.get('PANEL_CERT','/etc/letsencrypt/live/'+DOMAIN+'/fullchain.pem')
 PANEL_KEY=os.environ.get('PANEL_KEY','/etc/letsencrypt/live/'+DOMAIN+'/privkey.pem')
 PANEL_PORT=int(os.environ.get('PANEL_PORT','8443'))
+AUTH_PORT=int(os.environ.get('HYSTERIA_AUTH_PORT','9998'))
+DYNAMIC_AUTH=os.environ.get('HYSTERIA_DYNAMIC_AUTH')=='1'
 app=Flask(__name__); app.secret_key=os.environ['PANEL_SECRET']
 app.config.update(SESSION_COOKIE_SECURE=True,SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax')
 last_cpu=None; last_net=None; last_sample=0
 db_ready=False
+db_init_lock=threading.Lock()
 add_states={}
+delete_states={}
 add_states_lock=threading.Lock()
 
 def conn():
     global db_ready
     c=sqlite3.connect(DB); c.row_factory=sqlite3.Row
     if not db_ready:
-        c.execute('create table if not exists users(username text primary key,password text not null,enabled integer not null default 1)')
-        c.execute('create table if not exists usage(username text primary key,tx integer not null default 0,rx integer not null default 0,last_tx integer not null default 0,last_rx integer not null default 0)')
-        c.execute('create table if not exists settings(key text primary key,value text not null)')
-        c.commit(); db_ready=True
+        with db_init_lock:
+            if not db_ready:
+                c.execute('create table if not exists users(username text primary key,password text not null,enabled integer not null default 1)')
+                c.execute('create table if not exists usage(username text primary key,tx integer not null default 0,rx integer not null default 0,last_tx integer not null default 0,last_rx integer not null default 0)')
+                c.execute('create table if not exists settings(key text primary key,value text not null)')
+                c.commit(); db_ready=True
     return c
 def setting(key,default=''):
     c=conn(); r=c.execute('select value from settings where key=?',(key,)).fetchone(); c.close(); return r['value'] if r else default
@@ -51,7 +58,15 @@ def auth_version(): return setting('admin_auth_version','legacy')
 def api_get(path):
     with open(API_SECRET_FILE) as f: secret=f.read().strip()
     req=urllib.request.Request(API+path,headers={'Authorization':secret})
-    with urllib.request.urlopen(req,timeout=2) as r: return json.loads(r.read())
+    with urllib.request.urlopen(req,timeout=1) as r: return json.loads(r.read())
+
+def kick_user(username):
+    try:
+        with open(API_SECRET_FILE) as f: secret=f.read().strip()
+        req=urllib.request.Request(API+'/kick',data=json.dumps([username]).encode(),headers={'Authorization':secret,'Content-Type':'application/json'},method='POST')
+        with urllib.request.urlopen(req,timeout=1): pass
+    except Exception:
+        app.logger.exception('Could not disconnect disabled or deleted Hysteria user')
 def record_traffic():
     try: traffic=api_get('/traffic')
     except Exception: return
@@ -77,8 +92,12 @@ def write_server_config():
     c=conn(); rows=c.execute('select username,password from users where enabled=1 order by username').fetchall(); c.close()
     if not rows: raise ValueError('At least one Hysteria user must remain enabled')
     with open(API_SECRET_FILE) as f: api_secret=f.read().strip()
-    lines=['listen: :443','tls:','  cert: '+PANEL_CERT,'  key: '+PANEL_KEY,'auth:','  type: userpass','  userpass:']
-    lines += [f'    {r["username"]}: {r["password"]}' for r in rows]
+    lines=['listen: :443','tls:','  cert: '+PANEL_CERT,'  key: '+PANEL_KEY,'auth:']
+    if DYNAMIC_AUTH:
+        lines += ['  type: http','  http:','    url: http://127.0.0.1:'+str(AUTH_PORT)+'/auth']
+    else:
+        lines += ['  type: userpass','  userpass:']
+        lines += [f'    {r["username"]}: {r["password"]}' for r in rows]
     lines += ['trafficStats:','  listen: 127.0.0.1:9999','  secret: '+api_secret,'masquerade:','  type: proxy','  proxy:','    url: https://www.bing.com/','    rewriteHost: true']
     os.makedirs(os.path.dirname(HY2_CONFIG),exist_ok=True)
     p=HY2_CONFIG; tmp=p+'.tmp'
@@ -88,7 +107,40 @@ def write_server_config():
     subprocess.run(['systemctl','restart','hysteria-server'],check=True)
 
 def sync():
+    if DYNAMIC_AUTH: return
     subprocess.run(['/usr/bin/sudo','-n','/usr/local/sbin/hysteria-control-sync'],check=True)
+
+class HysteriaAuthHandler(BaseHTTPRequestHandler):
+    def setup(self):
+        self.request.settimeout(3)
+        super().setup()
+
+    def do_POST(self):
+        if self.path!='/auth':
+            self.send_error(404); return
+        try:
+            size=int(self.headers.get('Content-Length','0'))
+            if not 0<size<=2048: raise ValueError('invalid body size')
+            payload=json.loads(self.rfile.read(size))
+            auth=payload.get('auth','')
+            if not isinstance(auth,str) or len(auth)>512: raise ValueError('invalid auth')
+            username,separator,password=auth.partition(':')
+            if not separator or not re.fullmatch(r'[A-Za-z0-9_-]{1,32}',username): raise ValueError('invalid user')
+            c=conn()
+            try: user=c.execute('select username,password,enabled from users where username=?',(username,)).fetchone()
+            finally: c.close()
+            allowed=bool(user and user['enabled'] and secrets.compare_digest(password,user['password']))
+            body=json.dumps({'ok':allowed,'id':user['username'] if allowed else ''}).encode()
+        except (ValueError,TypeError,json.JSONDecodeError,sqlite3.Error):
+            body=b'{"ok":false,"id":""}'
+        self.send_response(200)
+        self.send_header('Content-Type','application/json')
+        self.send_header('Content-Length',str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self,*args):
+        pass
 
 def page(body):
     theme=request.cookies.get('theme','system')
@@ -127,6 +179,7 @@ function refreshCharts(users){let list=Object.entries(users||{}).map(([name,x])=
 function esc(s){let d=document.createElement('span');d.textContent=s;return d.innerHTML}
 function sortUsers(){let root=document.getElementById('userList'),mode=document.getElementById('sortBy')?.value;if(!root||!mode)return;let nodes=[...root.querySelectorAll('.client')];nodes.sort((a,b)=>{let av=mode==='traffic'?Number(a.dataset.total||0):a.dataset.user.toLowerCase(),bv=mode==='traffic'?Number(b.dataset.total||0):b.dataset.user.toLowerCase();return typeof av==='number'?bv-av:av.localeCompare(bv)});nodes.forEach(n=>root.appendChild(n))}document.getElementById('sortBy')?.addEventListener('change',sortUsers);
 const addForm=document.getElementById('addUserForm');if(addForm)addForm.addEventListener('submit',async e=>{e.preventDefault();const input=addForm.elements.u,username=input.value.trim(),button=addForm.querySelector('button'),status=document.getElementById('addStatus'),previous=button.textContent;const existing=[...document.querySelectorAll('.client[data-user]')].some(x=>x.dataset.user.toLowerCase()===username.toLowerCase());if(existing){status.hidden=false;status.classList.add('error');status.textContent=LANG==='en'?'This user already exists.':'Пользователь уже существует.';return}button.disabled=true;button.textContent=LANG==='en'?'Adding…':'Добавляем…';status.hidden=false;status.classList.remove('error');status.textContent=LANG==='en'?'Saving user and updating VPN. The connection may briefly drop; this page will recover automatically.':'Сохраняем пользователя и обновляем VPN. Связь может ненадолго прерваться; страница восстановится сама.';let failure='';fetch(addForm.action,{method:'POST',body:new FormData(addForm),credentials:'same-origin',redirect:'manual'}).then(async r=>{if(r.type!=='opaqueredirect'&&r.status!==302&&r.status!==303){const html=await r.text();failure=new DOMParser().parseFromString(html,'text/html').querySelector('h2')?.textContent|| (LANG==='en'?'Could not add user.':'Не удалось добавить пользователя.')}}).catch(()=>{});const deadline=Date.now()+45000;while(Date.now()<deadline&&!failure){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),4000);try{const r=await fetch('/api/add-status/'+encodeURIComponent(username),{credentials:'same-origin',cache:'no-store',signal:controller.signal});if(r.ok){const data=await r.json();if(data.status==='ready'){location.replace('/');return}if(data.status==='error'){failure=LANG==='en'?'VPN configuration was not updated. Check the server log.':'Не удалось обновить конфигурацию VPN. Проверьте журнал сервера.';break}}}catch(_){}finally{clearTimeout(timer)}await new Promise(resolve=>setTimeout(resolve,1500))}status.classList.add('error');status.textContent=failure|| (LANG==='en'?'Could not confirm the update. Check whether the user appeared before trying again.':'Не удалось подтвердить обновление. Проверьте, появился ли пользователь, прежде чем повторять попытку.');button.disabled=false;button.textContent=previous});
+document.querySelectorAll('form[action="/delete"]').forEach(form=>form.addEventListener('submit',async e=>{e.preventDefault();const username=form.elements.u.value;if(!confirm((LANG==='en'?'Delete user ':'Удалить пользователя ')+username+'?'))return;const button=form.querySelector('button'),meta=form.closest('.client').querySelector('.client-meta'),oldButton=button.textContent,oldMeta=meta.textContent;button.disabled=true;button.textContent=LANG==='en'?'Deleting…':'Удаляем…';meta.setAttribute('role','status');meta.textContent=LANG==='en'?'Removing the connection…':'Отключаем пользователя…';let failure='';fetch(form.action,{method:'POST',body:new FormData(form),credentials:'same-origin',redirect:'manual'}).then(async r=>{if(r.type!=='opaqueredirect'&&r.status!==302&&r.status!==303){const html=await r.text();failure=new DOMParser().parseFromString(html,'text/html').querySelector('h2')?.textContent|| (LANG==='en'?'Could not delete user.':'Не удалось удалить пользователя.')}}).catch(()=>{});const deadline=Date.now()+45000;while(Date.now()<deadline&&!failure){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),4000);try{const r=await fetch('/api/user-state/'+encodeURIComponent(username),{credentials:'same-origin',cache:'no-store',signal:controller.signal});if(r.ok){const data=await r.json();if(data.delete_status==='ready'&&!data.exists){location.replace('/');return}if(data.delete_status==='error'){failure=LANG==='en'?'Could not complete deletion. Check the server log.':'Не удалось завершить удаление. Проверьте журнал сервера.';break}}}catch(_){}finally{clearTimeout(timer)}await new Promise(resolve=>setTimeout(resolve,1500))}meta.textContent=failure|| (LANG==='en'?'Could not confirm deletion. Check the user list before trying again.':'Не удалось подтвердить удаление. Проверьте список пользователей, прежде чем повторять попытку.');meta.style.color='var(--bad)';button.disabled=false;button.textContent=oldButton}));
 function upd(){fetch('/api/metrics').then(r=>r.json()).then(d=>{document.querySelectorAll('[data-metric]').forEach(e=>{let k=e.dataset.metric;if(k in d)e.textContent=d[k]});let a=document.getElementById('serviceLamp');if(a){a.classList.toggle('off',!d.service);document.getElementById('serviceText').textContent=d.service?(LANG==='en'?'Online':'Работает'):(LANG==='en'?'Stopped':'Остановлена');let a2=document.getElementById('serviceLamp2');if(a2)a2.classList.toggle('off',!d.service)}if(d.resources){for(let k of ['ram','swap','disk']){let e=document.getElementById(k+'Bar');if(e)e.style.width=d.resources[k].percent+'%'}}if(d.users){for(let [u,x] of Object.entries(d.users)){let c=document.querySelector('[data-user="'+CSS.escape(u)+'"]');if(!c)continue;let lamp=c.querySelector('.userlamp');lamp.classList.toggle('off',!(x.online>0)||!x.enabled);c.querySelector('[data-traffic="tx"]').textContent=fmt(x.tx);c.querySelector('[data-traffic="rx"]').textContent=fmt(x.rx);c.dataset.total=x.tx+x.rx;let online=c.querySelector('[data-online]');if(online)online.textContent=x.online>0?(LANG==='en'?'Active':'Активно'):(LANG==='en'?'Offline':'Не в сети')}refreshCharts(d.users);sortUsers()}}).catch(()=>{})}upd();setInterval(upd,15000);
 function qr(btn){let box=btn.closest('.client').querySelector('.qr');if(!box.dataset.loaded){box.src=btn.dataset.qr;box.dataset.loaded='1'}box.classList.toggle('open')}
 function copyLink(btn){navigator.clipboard.writeText(btn.dataset.link);let t=btn.textContent;btn.textContent=LANG==='en'?'Copied':'Скопировано';setTimeout(()=>btn.textContent=t,1300)}
@@ -177,7 +230,7 @@ def home():
         name=u['username']; uri=f'hysteria2://{name}:{u["password"]}@{DOMAIN}:443/?sni={sni}&insecure=0#{name}'
         state='Включён' if u['enabled'] else 'Отключён'
         qrurl='/qr/'+urllib.parse.quote(name,safe='')
-        body+=f'''<div class=client data-user="{name}"><div><div class=client-name><span class="lamp userlamp {'off' if not u['enabled'] else ''}"></span>{name}<span class=pill>{state}</span></div><div class=client-meta data-online>Сверяем соединение…</div></div><div class=traffic><span>Входящий:</span> <b data-traffic=rx>—</b><br><span>Исходящий:</span> <b data-traffic=tx>—</b></div><div class=actions><button type=button class=small onclick="qr(this)" data-qr="{qrurl}">QR-код</button><button type=button class=small onclick="copyLink(this)" data-link="{uri}">Копировать</button><form method=post action=/toggle><input type=hidden name=csrf value="{tok}"><input type=hidden name=u value="{name}"><button class="small">{'Отключить' if u['enabled'] else 'Включить'}</button></form><form method=post action=/delete onsubmit="return confirm('Удалить пользователя {name}?')"><input type=hidden name=csrf value="{tok}"><input type=hidden name=u value="{name}"><button class="small danger">Удалить</button></form></div><div class=client-lower><div class=link>{uri}</div><div class=qr-wrap><img class=qr alt="QR код подключения"></div></div></div>'''
+        body+=f'''<div class=client data-user="{name}"><div><div class=client-name><span class="lamp userlamp {'off' if not u['enabled'] else ''}"></span>{name}<span class=pill>{state}</span></div><div class=client-meta data-online>Сверяем соединение…</div></div><div class=traffic><span>Входящий:</span> <b data-traffic=rx>—</b><br><span>Исходящий:</span> <b data-traffic=tx>—</b></div><div class=actions><button type=button class=small onclick="qr(this)" data-qr="{qrurl}">QR-код</button><button type=button class=small onclick="copyLink(this)" data-link="{uri}">Копировать</button><form method=post action=/toggle><input type=hidden name=csrf value="{tok}"><input type=hidden name=u value="{name}"><button class="small">{'Отключить' if u['enabled'] else 'Включить'}</button></form><form method=post action=/delete><input type=hidden name=csrf value="{tok}"><input type=hidden name=u value="{name}"><button class="small danger">Удалить</button></form></div><div class=client-lower><div class=link>{uri}</div><div class=qr-wrap><img class=qr alt="QR код подключения"></div></div></div>'''
     body+='''</div></section><div class=footer-note>Индикатор показывает текущую сессию Hysteria2. Трафик — накопительно с момента добавления пользователя.</div>'''
     return page(body)
 
@@ -233,11 +286,16 @@ def add_status(username):
 def toggle():
     if request.method=='GET': return redirect('/')
     if not logged(): abort(403)
-    check(); c=conn()
-    target=c.execute('select enabled from users where username=?',(request.form.get('u'),)).fetchone()
+    check(); username=request.form.get('u'); c=conn()
+    target=c.execute('select enabled from users where username=?',(username,)).fetchone()
     if target and target['enabled'] and c.execute('select count(*) from users where enabled=1').fetchone()[0]<=1:
         c.close(); return page('<div class="card login"><h2>Нужен хотя бы один активный пользователь</h2><a href="/"><button>Назад</button></a></div>')
-    c.execute('update users set enabled=1-enabled where username=?',(request.form.get('u'),)); c.commit(); c.close(); sync(); return redirect('/')
+    if target and target['enabled']:
+        c.close(); record_traffic(); c=conn()
+    c.execute('update users set enabled=1-enabled where username=?',(username,)); c.commit(); c.close()
+    sync()
+    if DYNAMIC_AUTH and target and target['enabled']: kick_user(username)
+    return redirect('/')
 @app.route('/delete',methods=['GET','POST'])
 def delete():
     if request.method=='GET': return redirect('/')
@@ -246,7 +304,23 @@ def delete():
     target=c.execute('select enabled from users where username=?',(username,)).fetchone()
     if target and target['enabled'] and c.execute('select count(*) from users where enabled=1').fetchone()[0]<=1:
         c.close(); return page('<div class="card login"><h2>Нужен хотя бы один активный пользователь</h2><a href="/"><button>Назад</button></a></div>')
-    c.execute('delete from users where username=?',(username,)); c.commit(); c.close(); sync(); return redirect('/')
+    c.execute('delete from users where username=?',(username,)); c.commit(); c.close()
+    with add_states_lock: delete_states[username]='pending'
+    try:
+        sync()
+        if DYNAMIC_AUTH and target: kick_user(username)
+    except Exception:
+        with add_states_lock: delete_states[username]='error'
+        raise
+    with add_states_lock: delete_states[username]='ready'
+    return redirect('/')
+
+@app.get('/api/user-state/<username>')
+def user_state(username):
+    if not logged(): abort(403)
+    c=conn(); user=c.execute('select enabled from users where username=?',(username,)).fetchone(); c.close()
+    with add_states_lock: status=delete_states.get(username,'unknown')
+    return {'exists':bool(user),'enabled':bool(user['enabled']) if user else False,'delete_status':status}
 @app.route('/sni',methods=['GET','POST'])
 def sni():
     if request.method=='GET': return redirect('/')
@@ -348,6 +422,12 @@ if __name__=='__main__':
     if sys.argv[1:]==['--sync-root']:
         write_server_config()
     else:
+        auth_server=ThreadingHTTPServer(('127.0.0.1',AUTH_PORT),HysteriaAuthHandler)
+        auth_server.daemon_threads=True
+        threading.Thread(target=auth_server.serve_forever,daemon=True).start()
         server=PanelServer()
         try: server.serve_forever()
-        finally: server.server_close()
+        finally:
+            server.server_close()
+            auth_server.shutdown()
+            auth_server.server_close()
