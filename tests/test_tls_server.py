@@ -36,6 +36,7 @@ class TLSServerTest(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("hysteria_control_test", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        cls.module = module
         cls.server = module.PanelServer()
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
@@ -64,6 +65,50 @@ class TLSServerTest(unittest.TestCase):
                 connection.close()
         finally:
             stalled.close()
+
+    def test_add_status_is_ready_only_after_sync(self):
+        module = self.module
+        started = threading.Event()
+        release = threading.Event()
+        original_sync = module.sync
+
+        def delayed_sync():
+            started.set()
+            self.assertTrue(release.wait(timeout=3))
+
+        module.sync = delayed_sync
+        try:
+            def authed_client():
+                client = module.app.test_client()
+                with client.session_transaction() as session:
+                    session["ok"] = True
+                    session["auth_version"] = module.auth_version()
+                    session["csrf"] = "test-csrf"
+                return client
+
+            writer = authed_client()
+            reader = authed_client()
+            response = []
+            worker = threading.Thread(
+                target=lambda: response.append(writer.post(
+                    "/add", data={"u": "TestUser1", "csrf": "test-csrf"}
+                )),
+            )
+            worker.start()
+            self.assertTrue(started.wait(timeout=3))
+            self.assertEqual(
+                reader.get("/api/add-status/TestUser1").json["status"], "pending"
+            )
+            release.set()
+            worker.join(timeout=3)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(response[0].status_code, 302)
+            self.assertEqual(
+                reader.get("/api/add-status/TestUser1").json["status"], "ready"
+            )
+        finally:
+            release.set()
+            module.sync = original_sync
 
 
 if __name__ == "__main__":
