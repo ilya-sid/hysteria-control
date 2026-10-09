@@ -1,4 +1,4 @@
-import os, sqlite3, secrets, subprocess, re, json, urllib.request, urllib.parse, sys, hashlib, base64, grp, time, ssl, threading
+import os, sqlite3, secrets, subprocess, re, json, urllib.request, urllib.parse, sys, hashlib, base64, grp, time, ssl, threading, shutil
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from flask import Flask, request, session, redirect, abort, make_response, Response, send_from_directory
 from werkzeug.serving import ThreadedWSGIServer
@@ -15,20 +15,26 @@ PANEL_PORT=int(os.environ.get('PANEL_PORT','8443'))
 AUTH_PORT=int(os.environ.get('HYSTERIA_AUTH_PORT','9998'))
 DYNAMIC_AUTH=os.environ.get('HYSTERIA_DYNAMIC_AUTH')=='1'
 app=Flask(__name__); app.secret_key=os.environ['PANEL_SECRET']
-app.config.update(SESSION_COOKIE_SECURE=True,SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax')
+app.config.update(SESSION_COOKIE_SECURE=True,SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',MAX_CONTENT_LENGTH=16384)
 last_cpu=None; last_net=None; last_sample=0
 db_ready=False
 db_init_lock=threading.Lock()
 add_states={}
 delete_states={}
 add_states_lock=threading.Lock()
+traffic_lock=threading.Lock()
+cpu_lock=threading.Lock()
+vpn_lock=threading.Lock()
+vpn_cache={'sampled':0,'online':None,'service':None}
+api_opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 def conn():
     global db_ready
-    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row
+    c=sqlite3.connect(DB,timeout=1); c.row_factory=sqlite3.Row
     if not db_ready:
         with db_init_lock:
             if not db_ready:
+                c.execute('pragma journal_mode=WAL')
                 c.execute('create table if not exists users(username text primary key,password text not null,enabled integer not null default 1)')
                 c.execute('create table if not exists usage(username text primary key,tx integer not null default 0,rx integer not null default 0,last_tx integer not null default 0,last_rx integer not null default 0)')
                 c.execute('create table if not exists settings(key text primary key,value text not null)')
@@ -53,40 +59,64 @@ def verify_password(password,encoded):
 def admin_password_matches(password):
     stored=setting('admin_password_hash')
     if stored: return verify_password(password,stored)
-    return secrets.compare_digest(password,os.environ['PANEL_PASS'])
+    return secrets.compare_digest(password.encode(),os.environ['PANEL_PASS'].encode())
 def auth_version(): return setting('admin_auth_version','legacy')
 def api_get(path):
     with open(API_SECRET_FILE) as f: secret=f.read().strip()
     req=urllib.request.Request(API+path,headers={'Authorization':secret})
-    with urllib.request.urlopen(req,timeout=1) as r: return json.loads(r.read())
+    with api_opener.open(req,timeout=1) as r:
+        body=r.read(4194305)
+        if len(body)>4194304: raise ValueError('Statistics response too large')
+        return json.loads(body)
 
 def kick_user(username):
     try:
         with open(API_SECRET_FILE) as f: secret=f.read().strip()
         req=urllib.request.Request(API+'/kick',data=json.dumps([username]).encode(),headers={'Authorization':secret,'Content-Type':'application/json'},method='POST')
-        with urllib.request.urlopen(req,timeout=1): pass
+        with api_opener.open(req,timeout=1): pass
     except Exception:
         app.logger.exception('Could not disconnect disabled or deleted Hysteria user')
-def record_traffic():
-    try: traffic=api_get('/traffic')
-    except Exception: return
-    c=conn()
-    changed=False
-    for name,v in traffic.items():
-        owner=c.execute('select username from users where username=? collate nocase',(name,)).fetchone()
-        if not owner: continue
-        name=owner['username']
-        tx=max(0,int(v.get('tx',0))); rx=max(0,int(v.get('rx',0)))
-        old=c.execute('select tx,rx,last_tx,last_rx from usage where username=?',(name,)).fetchone()
-        if old:
-            if tx==old['last_tx'] and rx==old['last_rx']: continue
-            addtx=tx-old['last_tx'] if tx>=old['last_tx'] else tx
-            addrx=rx-old['last_rx'] if rx>=old['last_rx'] else rx
-            c.execute('update usage set tx=tx+?,rx=rx+?,last_tx=?,last_rx=? where username=?',(max(0,addtx),max(0,addrx),tx,rx,name))
-        else: c.execute('insert into usage(username,tx,rx,last_tx,last_rx) values(?,?,?,?,?)',(name,tx,rx,tx,rx))
-        changed=True
-    if changed: c.commit()
-    c.close()
+def record_traffic(traffic=None):
+    # One writer per sample prevents concurrent browser polls double-counting.
+    if not traffic_lock.acquire(blocking=False): return
+    c=None
+    try:
+        if traffic is None: traffic=api_get('/traffic')
+        if not isinstance(traffic,dict): raise ValueError('Invalid traffic response')
+        c=conn()
+        owners={r['username']:r['username'] for r in c.execute('select username from users')}
+        for name,v in traffic.items():
+            if name not in owners or not isinstance(v,dict): continue
+            tx=max(0,int(v.get('tx',0))); rx=max(0,int(v.get('rx',0)))
+            c.execute('''insert into usage(username,tx,rx,last_tx,last_rx) values(?,?,?,?,?)
+                on conflict(username) do update set
+                tx=usage.tx+case when excluded.last_tx>=usage.last_tx then excluded.last_tx-usage.last_tx else excluded.last_tx end,
+                rx=usage.rx+case when excluded.last_rx>=usage.last_rx then excluded.last_rx-usage.last_rx else excluded.last_rx end,
+                last_tx=excluded.last_tx,last_rx=excluded.last_rx
+                where usage.last_tx!=excluded.last_tx or usage.last_rx!=excluded.last_rx''',(name,tx,rx,tx,rx))
+        c.commit()
+    except (OSError,ValueError,TypeError,sqlite3.Error):
+        if c: c.rollback()
+        app.logger.warning('Traffic sample unavailable')
+    finally:
+        if c: c.close()
+        traffic_lock.release()
+
+def vpn_state():
+    if time.monotonic()-vpn_cache['sampled']<5: return dict(vpn_cache)
+    if not vpn_lock.acquire(blocking=False): return dict(vpn_cache)
+    try:
+        if time.monotonic()-vpn_cache['sampled']<5: return dict(vpn_cache)
+        try:
+            online=api_get('/online')
+            if not isinstance(online,dict): raise ValueError('Invalid online response')
+            online={str(name):max(0,int(count)) for name,count in online.items()}
+            vpn_cache.update(online=online,service=True)
+        except (OSError,ValueError,TypeError): vpn_cache.update(online=None,service=None)
+        record_traffic()
+        vpn_cache['sampled']=time.monotonic()
+        return dict(vpn_cache)
+    finally: vpn_lock.release()
 def write_server_config():
     record_traffic()
     c=conn(); rows=c.execute('select username,password from users where enabled=1 order by username').fetchall(); c.close()
@@ -104,11 +134,11 @@ def write_server_config():
     with open(tmp,'w') as f: f.write('\n'.join(lines)+'\n')
     os.chown(tmp,0,grp.getgrnam('hysteria-control').gr_gid)
     os.chmod(tmp,0o640); os.replace(tmp,p)
-    subprocess.run(['systemctl','restart','hysteria-server'],check=True)
+    subprocess.run(['systemctl','restart','hysteria-server'],check=True,timeout=15)
 
 def sync():
     if DYNAMIC_AUTH: return
-    subprocess.run(['/usr/bin/sudo','-n','/usr/local/sbin/hysteria-control-sync'],check=True)
+    subprocess.run(['/usr/bin/sudo','-n','/usr/local/sbin/hysteria-control-sync'],check=True,timeout=15)
 
 class HysteriaAuthHandler(BaseHTTPRequestHandler):
     def setup(self):
@@ -122,6 +152,7 @@ class HysteriaAuthHandler(BaseHTTPRequestHandler):
             size=int(self.headers.get('Content-Length','0'))
             if not 0<size<=2048: raise ValueError('invalid body size')
             payload=json.loads(self.rfile.read(size))
+            if not isinstance(payload,dict): raise ValueError('invalid body')
             auth=payload.get('auth','')
             if not isinstance(auth,str) or len(auth)>512: raise ValueError('invalid auth')
             username,separator,password=auth.partition(':')
@@ -129,7 +160,7 @@ class HysteriaAuthHandler(BaseHTTPRequestHandler):
             c=conn()
             try: user=c.execute('select username,password,enabled from users where username=?',(username,)).fetchone()
             finally: c.close()
-            allowed=bool(user and user['enabled'] and secrets.compare_digest(password,user['password']))
+            allowed=bool(user and user['enabled'] and secrets.compare_digest(password.encode(),user['password'].encode()))
             body=json.dumps({'ok':allowed,'id':user['username'] if allowed else ''}).encode()
         except (ValueError,TypeError,json.JSONDecodeError,sqlite3.Error):
             body=b'{"ok":false,"id":""}'
@@ -141,6 +172,20 @@ class HysteriaAuthHandler(BaseHTTPRequestHandler):
 
     def log_message(self,*args):
         pass
+
+class HysteriaAuthServer(ThreadingHTTPServer):
+    daemon_threads=True
+    def __init__(self,address,handler=HysteriaAuthHandler):
+        self.connections=threading.BoundedSemaphore(16)
+        super().__init__(address,handler)
+    def process_request(self,request,address):
+        if not self.connections.acquire(blocking=False): request.close(); return
+        try: super().process_request(request,address)
+        except BaseException:
+            self.connections.release(); request.close(); raise
+    def process_request_thread(self,request,address):
+        try: super().process_request_thread(request,address)
+        finally: self.connections.release()
 
 def page(body):
     theme=request.cookies.get('theme','system')
@@ -164,9 +209,10 @@ a{color:inherit;text-decoration:none}button,input,select{font:inherit}button{bor
 @media(max-width:420px){.route-setting-form{align-items:flex-start;flex-direction:column}.client{grid-template-columns:1fr}.client .traffic{grid-column:1;grid-row:auto}.client .actions{grid-column:1}.client-lower{grid-template-columns:minmax(0,1fr)}}
 .bar-col small{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:1.2;color:var(--text);font-variant-numeric:tabular-nums}
 .add-status{margin:10px 0 0;color:var(--muted)}.add-status.error{color:var(--bad)}.form-row button:disabled{opacity:.65;cursor:wait;transform:none}
+.shell{width:100%;min-width:0}.shell>*{min-width:0}.chart-grid{grid-template-columns:minmax(0,1fr) minmax(0,1.6fr);width:100%}.chart-box{min-width:0;max-width:100%;overflow:hidden}.bars{width:100%;max-width:100%;min-width:0;overflow-x:auto;overflow-y:hidden;overscroll-behavior-x:contain;touch-action:pan-x pan-y;scrollbar-gutter:stable}.bar-col{flex:0 0 72px;min-width:72px;max-width:72px}.bar-col i{flex-shrink:1}.bar-col span,.bar-col small{flex-shrink:0}.legend{min-width:0;max-height:190px;overflow:auto;overflow-wrap:anywhere}.donut-wrap{min-width:0}.lamp.unknown{background:var(--muted);box-shadow:0 0 0 4px color-mix(in srgb,var(--muted) 16%,transparent)}@media(max-width:850px){.chart-grid{grid-template-columns:minmax(0,1fr)}}@media(max-width:560px){.donut-wrap{flex-wrap:wrap}.top{gap:12px;flex-wrap:wrap}.brand{min-width:0}.brand h1{overflow-wrap:anywhere}}
 '''
     script='''
-const LANG='__LANG__',T={"Работает":"Online","Остановлена":"Stopped","Не в сети":"Offline","Активно":"Active","Сверяем соединение…":"Checking connection…","Панель управления сервером":"Server control panel","Личный сервер":"Private server","Вход в панель":"Sign in","Управление сервером и доступом пользователей":"Manage your server and user access","Логин":"Username","Пароль":"Password","Войти":"Sign in","Неверный логин или пароль":"Incorrect username or password","Обзор сервера":"Server overview","Состояние узла и активность подключений":"Node status and connection activity","обновление каждые 15 сек":"refresh every 15 sec","Нагрузка на процессор":"CPU usage","текущая загрузка CPU":"current CPU usage","Оперативная память":"Memory","Swap":"Swap","Диск":"Disk","Hysteria2":"Hysteria2","Сохранить SNI":"Save SNI","Пользователи":"Users","Индивидуальные подключения и их трафик":"User connections and traffic","всего":"total","Имя нового пользователя":"New username","＋ Добавить пользователя":"＋ Add user","Пока нет пользователей. Добавьте первого выше.":"No users yet. Add the first one above.","Включён":"Enabled","Отключён":"Disabled","Скачать":"Download","Скачано":"Downloaded","Загружено":"Uploaded","Входящий":"Incoming","Исходящий":"Outgoing","QR-код":"QR code","Копировать":"Copy","Отключить":"Disable","Включить":"Enable","Удалить":"Delete","Индикатор показывает текущую сессию Hysteria2. Трафик — накопительно с момента добавления пользователя.":"The indicator shows the current Hysteria2 session. Traffic is cumulative since the user was added.","Смена пароля":"Change password","Введите текущий и новый пароль.":"Enter your current and new password.","Текущий пароль":"Current password","Новый пароль (от 12 символов)":"New password (12+ characters)","Повторите новый пароль":"Confirm new password","Сменить пароль":"Change password","Тема":"Theme","Язык":"Language","Светлая":"Light","Тёмная":"Dark","Русский":"Russian","Английский":"English","Настройки":"Settings","Маршрутизация сайтов":"Site routing","Российские сайты напрямую":"Route Russian sites directly","Включает обход VPN для доменов из списка geosite-ru. Правило действует в экспортируемом профиле sing-box.":"Bypass VPN for domains in the Russian geosite list. This applies to the exported sing-box profile.","Сохранить":"Save","Быстрое исключение":"Quick bypass exception","Добавить домен или IP":"Add domain or IP","Добавить":"Add","Домены и IP, направляемые напрямую":"Domains and IPs routed directly","Пока исключений нет":"No exceptions yet","Статистика трафика пользователей":"User traffic statistics","Доли трафика":"Traffic share","Трафик по пользователям":"Traffic by user","Сортировать":"Sort by","По имени":"Name","По трафику":"Traffic","по возрастанию":"Ascending","по убыванию":"Descending","Получить профиль sing-box":"Get sing-box profile","Обычная Hysteria-ссылка не содержит маршрутизацию. Для правил используйте профиль sing-box.":"A regular Hysteria link does not contain routing rules. Use a sing-box profile to apply these rules.","Правила применяются на устройстве клиента":"Rules are applied on the client device","Профиль включает российские домены и ваши исключения напрямую; остальной трафик идёт через Hysteria.":"The profile routes Russian domains and your exceptions directly; other traffic goes through Hysteria.","Уже существует":"Already exists","Скопировано":"Copied","Переход на главную":"Back to panel","Обновить SNI":"Save SNI"};
+const LANG='__LANG__',T={"Работает":"Online","Остановлена":"Stopped","Не в сети":"Offline","Активно":"Active","Сверяем соединение…":"Checking connection…","Панель управления сервером":"Server control panel","Личный сервер":"Private server","Вход в панель":"Sign in","Управление сервером и доступом пользователей":"Manage your server and user access","Логин":"Username","Пароль":"Password","Войти":"Sign in","Неверный логин или пароль":"Incorrect username or password","Обзор сервера":"Server overview","Состояние узла и активность подключений":"Node status and connection activity","обновление каждые 5 сек":"refresh every 5 sec","Нагрузка на процессор":"CPU usage","текущая загрузка CPU":"current CPU usage","Оперативная память":"Memory","Swap":"Swap","Диск":"Disk","Hysteria2":"Hysteria2","Сохранить SNI":"Save SNI","Пользователи":"Users","Индивидуальные подключения и их трафик":"User connections and traffic","всего":"total","Имя нового пользователя":"New username","＋ Добавить пользователя":"＋ Add user","Пока нет пользователей. Добавьте первого выше.":"No users yet. Add the first one above.","Включён":"Enabled","Отключён":"Disabled","Скачать":"Download","Скачано":"Downloaded","Загружено":"Uploaded","Входящий":"Incoming","Исходящий":"Outgoing","QR-код":"QR code","Копировать":"Copy","Отключить":"Disable","Включить":"Enable","Удалить":"Delete","Индикатор показывает текущую сессию Hysteria2. Трафик — накопительно с момента добавления пользователя.":"The indicator shows the current Hysteria2 session. Traffic is cumulative since the user was added.","Смена пароля":"Change password","Введите текущий и новый пароль.":"Enter your current and new password.","Текущий пароль":"Current password","Новый пароль (от 12 символов)":"New password (12+ characters)","Повторите новый пароль":"Confirm new password","Сменить пароль":"Change password","Тема":"Theme","Язык":"Language","Светлая":"Light","Тёмная":"Dark","Русский":"Russian","Английский":"English","Настройки":"Settings","Маршрутизация сайтов":"Site routing","Российские сайты напрямую":"Route Russian sites directly","Включает обход VPN для доменов из списка geosite-ru. Правило действует в экспортируемом профиле sing-box.":"Bypass VPN for domains in the Russian geosite list. This applies to the exported sing-box profile.","Сохранить":"Save","Быстрое исключение":"Quick bypass exception","Добавить домен или IP":"Add domain or IP","Добавить":"Add","Домены и IP, направляемые напрямую":"Domains and IPs routed directly","Пока исключений нет":"No exceptions yet","Статистика трафика пользователей":"User traffic statistics","Доли трафика":"Traffic share","Трафик по пользователям":"Traffic by user","Сортировать":"Sort by","По имени":"Name","По трафику":"Traffic","по возрастанию":"Ascending","по убыванию":"Descending","Получить профиль sing-box":"Get sing-box profile","Обычная Hysteria-ссылка не содержит маршрутизацию. Для правил используйте профиль sing-box.":"A regular Hysteria link does not contain routing rules. Use a sing-box profile to apply these rules.","Правила применяются на устройстве клиента":"Rules are applied on the client device","Профиль включает российские домены и ваши исключения напрямую; остальной трафик идёт через Hysteria.":"The profile routes Russian domains and your exceptions directly; other traffic goes through Hysteria.","Уже существует":"Already exists","Скопировано":"Copied","Переход на главную":"Back to panel","Обновить SNI":"Save SNI"};
 Object.assign(T,{"Выйти":"Sign out","Проверяем сервер":"Checking server","Накопленные данные по всем подключениям":"Cumulative data for all connections","Включает обход VPN для доменов и IP России. Правило действует в экспортируемом профиле sing-box.":"Bypass VPN for Russian domains and IPs in the exported sing-box profile.","Неверный домен или IP":"Invalid domain or IP","Назад":"Back","Текущий пароль неверен":"Current password is incorrect","Пароль должен содержать от 12 до 256 символов":"Password must be 12–256 characters","Новые пароли не совпадают":"New passwords do not match","Пароль изменён":"Password changed","Войдите снова с новым паролем.":"Sign in with your new password.","Перейти ко входу":"Go to sign in","Форма устарела":"Form expired","Обновите страницу и добавьте пользователя ещё раз.":"Refresh the page and add the user again.","Вернуться в панель":"Back to panel","Неверное имя пользователя":"Invalid username","Используйте 1–32 латинские буквы, цифры, _ или -.":"Use 1–32 Latin letters, digits, _ or -.","Пользователь уже существует":"User already exists","Выберите другое имя.":"Choose another name.","Нужен хотя бы один активный пользователь":"At least one active user is required","SNI должен совпадать с доменом TLS-сертификата:":"SNI must match the TLS certificate domain:"});
 Object.assign(T,{"Направление":"Route","Напрямую":"Direct","Через VPN":"Through VPN","Домен или IP можно направить напрямую или через VPN":"Route a domain or IP directly or through the VPN"});
 Object.assign(T,{"Как в системе":"System"});
@@ -175,18 +221,20 @@ const themeBtn=document.getElementById('themeToggle');if(themeBtn)themeBtn.oncli
 const gear=document.getElementById('gearToggle'),settings=document.getElementById('settingsPanel');if(gear&&settings){gear.onclick=()=>settings.hidden=!settings.hidden;document.addEventListener('click',e=>{if(!e.target.closest('.gear-menu'))settings.hidden=true})}const langSel=document.getElementById('languageSelect');if(langSel){langSel.value=LANG;langSel.onchange=()=>{document.cookie='language='+langSel.value+';path=/;max-age=31536000';location.reload()}}const themeSel=document.getElementById('themeSelect');if(themeSel){let savedTheme=document.cookie.match(/(?:^|; )theme=([^;]+)/)?.[1]||'system';themeSel.value=['system','light','dark'].includes(savedTheme)?savedTheme:'system';themeSel.onchange=()=>{document.cookie='theme='+themeSel.value+';path=/;max-age=31536000';location.reload()}};
 const passBtn=document.getElementById('passwordToggle'),passForm=document.getElementById('passwordPanel');if(passBtn&&passForm)passBtn.onclick=()=>passForm.hidden=!passForm.hidden;
 function fmt(b){if(!Number.isFinite(b))return '—';let value=b/1e6,unit=LANG==='en'?['MB','GB','TB']:['МБ','ГБ','ТБ'],i=0;while(value>=1000&&i<unit.length-1){value/=1000;i++}return value.toFixed(1)+' '+unit[i]}
-function refreshCharts(users){let list=Object.entries(users||{}).map(([name,x])=>({name,total:x.tx+x.rx,tx:x.tx,rx:x.rx})).sort((a,b)=>b.total-a.total),sum=list.reduce((n,x)=>n+x.total,0),ring=document.getElementById('trafficDonut'),legend=document.getElementById('trafficLegend'),bars=document.getElementById('trafficBars');if(!ring||!legend||!bars)return;let colors=['var(--accent)','#55bdec','#71cba3','#f0a346','#9d8cf4','#e26f85','#64bbc3'];let at=0,parts=[];list.forEach((x,i)=>{let end=at+(sum?x.total/sum*100:0);parts.push(`${colors[i%colors.length]} ${at}% ${end}%`);at=end});ring.style.background=`conic-gradient(${parts.join(',')||'var(--border) 0 100%'})`;legend.innerHTML=list.length?list.map((x,i)=>`<div><i style="background:${colors[i%colors.length]}"></i>${esc(x.name)} · ${fmt(x.total)}</div>`).join(''):'—';bars.innerHTML=list.map(x=>`<div class="bar-col" title="${esc(x.name)}: ${fmt(x.total)}"><i style="height:${sum?Math.max(2,x.total/Math.max(...list.map(v=>v.total))*100):2}%"></i><span>${esc(x.name)}</span><small title="${LANG==='en'?'Incoming':'Входящий'}: ${fmt(x.rx)}">↓ ${fmt(x.rx)}</small></div>`).join('');}
+function refreshCharts(users){let list=Object.entries(users||{}).map(([name,x])=>({name,total:x.tx+x.rx,tx:x.tx,rx:x.rx})).sort((a,b)=>b.total-a.total),sum=list.reduce((n,x)=>n+x.total,0),ring=document.getElementById('trafficDonut'),legend=document.getElementById('trafficLegend'),bars=document.getElementById('trafficBars');if(!ring||!legend||!bars)return;let colors=['var(--accent)','#55bdec','#71cba3','#f0a346','#9d8cf4','#e26f85','#64bbc3'];const scroll=bars.scrollLeft,max=Math.max(1,...list.map(x=>x.total));let at=0,parts=[];list.forEach((x,i)=>{let end=at+(sum?x.total/sum*100:0);parts.push(`${colors[i%colors.length]} ${at}% ${end}%`);at=end});ring.style.background=`conic-gradient(${parts.join(',')||'var(--border) 0 100%'})`;legend.innerHTML=list.length?list.map((x,i)=>`<div><i style="background:${colors[i%colors.length]}"></i>${esc(x.name)} · ${fmt(x.total)}</div>`).join(''):'—';bars.innerHTML=list.map(x=>`<div class="bar-col" title="${esc(x.name)}: ${fmt(x.total)}"><i style="height:${sum?Math.max(2,x.total/max*100):2}%"></i><span>${esc(x.name)}</span><small title="${LANG==='en'?'Incoming':'Входящий'}: ${fmt(x.rx)}">↓ ${fmt(x.rx)}</small></div>`).join('');bars.scrollLeft=scroll;}
 function esc(s){let d=document.createElement('span');d.textContent=s;return d.innerHTML}
 function sortUsers(){let root=document.getElementById('userList'),mode=document.getElementById('sortBy')?.value;if(!root||!mode)return;let nodes=[...root.querySelectorAll('.client')];nodes.sort((a,b)=>{let av=mode==='traffic'?Number(a.dataset.total||0):a.dataset.user.toLowerCase(),bv=mode==='traffic'?Number(b.dataset.total||0):b.dataset.user.toLowerCase();return typeof av==='number'?bv-av:av.localeCompare(bv)});nodes.forEach(n=>root.appendChild(n))}document.getElementById('sortBy')?.addEventListener('change',sortUsers);
 const addForm=document.getElementById('addUserForm');if(addForm)addForm.addEventListener('submit',async e=>{e.preventDefault();const input=addForm.elements.u,username=input.value.trim(),button=addForm.querySelector('button'),status=document.getElementById('addStatus'),previous=button.textContent;const existing=[...document.querySelectorAll('.client[data-user]')].some(x=>x.dataset.user.toLowerCase()===username.toLowerCase());if(existing){status.hidden=false;status.classList.add('error');status.textContent=LANG==='en'?'This user already exists.':'Пользователь уже существует.';return}button.disabled=true;button.textContent=LANG==='en'?'Adding…':'Добавляем…';status.hidden=false;status.classList.remove('error');status.textContent=LANG==='en'?'Saving user and updating VPN. The connection may briefly drop; this page will recover automatically.':'Сохраняем пользователя и обновляем VPN. Связь может ненадолго прерваться; страница восстановится сама.';let failure='';fetch(addForm.action,{method:'POST',body:new FormData(addForm),credentials:'same-origin',redirect:'manual'}).then(async r=>{if(r.type!=='opaqueredirect'&&r.status!==302&&r.status!==303){const html=await r.text();failure=new DOMParser().parseFromString(html,'text/html').querySelector('h2')?.textContent|| (LANG==='en'?'Could not add user.':'Не удалось добавить пользователя.')}}).catch(()=>{});const deadline=Date.now()+45000;while(Date.now()<deadline&&!failure){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),4000);try{const r=await fetch('/api/add-status/'+encodeURIComponent(username),{credentials:'same-origin',cache:'no-store',signal:controller.signal});if(r.ok){const data=await r.json();if(data.status==='ready'){location.replace('/');return}if(data.status==='error'){failure=LANG==='en'?'VPN configuration was not updated. Check the server log.':'Не удалось обновить конфигурацию VPN. Проверьте журнал сервера.';break}}}catch(_){}finally{clearTimeout(timer)}await new Promise(resolve=>setTimeout(resolve,1500))}status.classList.add('error');status.textContent=failure|| (LANG==='en'?'Could not confirm the update. Check whether the user appeared before trying again.':'Не удалось подтвердить обновление. Проверьте, появился ли пользователь, прежде чем повторять попытку.');button.disabled=false;button.textContent=previous});
 document.querySelectorAll('form[action="/delete"]').forEach(form=>form.addEventListener('submit',async e=>{e.preventDefault();const username=form.elements.u.value;if(!confirm((LANG==='en'?'Delete user ':'Удалить пользователя ')+username+'?'))return;const button=form.querySelector('button'),meta=form.closest('.client').querySelector('.client-meta'),oldButton=button.textContent,oldMeta=meta.textContent;button.disabled=true;button.textContent=LANG==='en'?'Deleting…':'Удаляем…';meta.setAttribute('role','status');meta.textContent=LANG==='en'?'Removing the connection…':'Отключаем пользователя…';let failure='';fetch(form.action,{method:'POST',body:new FormData(form),credentials:'same-origin',redirect:'manual'}).then(async r=>{if(r.type!=='opaqueredirect'&&r.status!==302&&r.status!==303){const html=await r.text();failure=new DOMParser().parseFromString(html,'text/html').querySelector('h2')?.textContent|| (LANG==='en'?'Could not delete user.':'Не удалось удалить пользователя.')}}).catch(()=>{});const deadline=Date.now()+45000;while(Date.now()<deadline&&!failure){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),4000);try{const r=await fetch('/api/user-state/'+encodeURIComponent(username),{credentials:'same-origin',cache:'no-store',signal:controller.signal});if(r.ok){const data=await r.json();if(data.delete_status==='ready'&&!data.exists){location.replace('/');return}if(data.delete_status==='error'){failure=LANG==='en'?'Could not complete deletion. Check the server log.':'Не удалось завершить удаление. Проверьте журнал сервера.';break}}}catch(_){}finally{clearTimeout(timer)}await new Promise(resolve=>setTimeout(resolve,1500))}meta.textContent=failure|| (LANG==='en'?'Could not confirm deletion. Check the user list before trying again.':'Не удалось подтвердить удаление. Проверьте список пользователей, прежде чем повторять попытку.');meta.style.color='var(--bad)';button.disabled=false;button.textContent=oldButton}));
-function upd(){fetch('/api/metrics').then(r=>r.json()).then(d=>{document.querySelectorAll('[data-metric]').forEach(e=>{let k=e.dataset.metric;if(k in d)e.textContent=d[k]});let a=document.getElementById('serviceLamp');if(a){a.classList.toggle('off',!d.service);document.getElementById('serviceText').textContent=d.service?(LANG==='en'?'Online':'Работает'):(LANG==='en'?'Stopped':'Остановлена');let a2=document.getElementById('serviceLamp2');if(a2)a2.classList.toggle('off',!d.service)}if(d.resources){for(let k of ['ram','swap','disk']){let e=document.getElementById(k+'Bar');if(e)e.style.width=d.resources[k].percent+'%'}}if(d.users){for(let [u,x] of Object.entries(d.users)){let c=document.querySelector('[data-user="'+CSS.escape(u)+'"]');if(!c)continue;let lamp=c.querySelector('.userlamp');lamp.classList.toggle('off',!(x.online>0)||!x.enabled);c.querySelector('[data-traffic="tx"]').textContent=fmt(x.tx);c.querySelector('[data-traffic="rx"]').textContent=fmt(x.rx);c.dataset.total=x.tx+x.rx;let online=c.querySelector('[data-online]');if(online)online.textContent=x.online>0?(LANG==='en'?'Active':'Активно'):(LANG==='en'?'Offline':'Не в сети')}refreshCharts(d.users);sortUsers()}}).catch(()=>{})}upd();setInterval(upd,15000);
+let metricsBusy=false;async function upd(){if(metricsBusy||document.hidden)return;metricsBusy=true;const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),5000);try{const r=await fetch('/api/metrics',{signal:controller.signal,cache:'no-store'});if(!r.ok)throw new Error('Metrics unavailable');const d=await r.json();document.querySelectorAll('[data-metric]').forEach(e=>{if(e.dataset.metric in d)e.textContent=d[e.dataset.metric]});for(const id of ['serviceLamp','serviceLamp2']){const e=document.getElementById(id);if(e){e.classList.toggle('off',d.service===false);e.classList.toggle('unknown',d.service===null)}}const serviceText=document.getElementById('serviceText');if(serviceText)serviceText.textContent=d.service===null?(LANG==='en'?'Status unavailable':'Статус недоступен'):d.service?(LANG==='en'?'Online':'Работает'):(LANG==='en'?'Stopped':'Остановлена');if(d.resources)for(const k of ['ram','swap','disk']){const e=document.getElementById(k+'Bar');if(e)e.style.width=d.resources[k].percent+'%'}if(d.users){for(const c of document.querySelectorAll('.client[data-user]')){const x=d.users[c.dataset.user];if(!x)continue;const lamp=c.querySelector('.userlamp'),unknown=x.enabled&&x.online===null;lamp.classList.toggle('off',!x.enabled||(!unknown&&x.online===0));lamp.classList.toggle('unknown',unknown);c.querySelector('[data-traffic="tx"]').textContent=fmt(x.tx);c.querySelector('[data-traffic="rx"]').textContent=fmt(x.rx);c.dataset.total=x.tx+x.rx;const online=c.querySelector('[data-online]');if(online)online.textContent=unknown?(LANG==='en'?'Status unavailable':'Статус недоступен'):x.online>0?(LANG==='en'?'Active':'Активно'):(LANG==='en'?'Offline':'Не в сети')}refreshCharts(d.users);sortUsers()}}catch(_){document.querySelectorAll('.userlamp,#serviceLamp,#serviceLamp2').forEach(e=>{e.classList.remove('off');e.classList.add('unknown')});document.querySelectorAll('[data-online],#serviceText').forEach(e=>e.textContent=LANG==='en'?'Status unavailable':'Статус недоступен')}finally{clearTimeout(timeout);metricsBusy=false}}upd();setInterval(upd,5000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)upd()});
 function qr(btn){let box=btn.closest('.client').querySelector('.qr');if(!box.dataset.loaded){box.src=btn.dataset.qr;box.dataset.loaded='1'}box.classList.toggle('open')}
 function copyLink(btn){navigator.clipboard.writeText(btn.dataset.link);let t=btn.textContent;btn.textContent=LANG==='en'?'Copied':'Скопировано';setTimeout(()=>btn.textContent=t,1300)}
 '''.replace('__LANG__',lang)
     html='<!doctype html><html lang="__LANG__"><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Hysteria Control</title><style>__CSS__</style></head><body class="__THEME__"><div class=shell>__BODY__</div><script>__SCRIPT__</script></body></html>'
     html=html.replace('__CSS__',css).replace('__THEME__',theme).replace('__BODY__',body).replace('__SCRIPT__',script).replace('__LANG__',lang)
-    return make_response(html)
+    response=make_response(html)
+    response.headers['Cache-Control']='no-store'
+    return response
 
 def logged(): return session.get('ok') is True and session.get('auth_version')==auth_version()
 def csrf():
@@ -195,7 +243,7 @@ def csrf():
 def valid_csrf():
     token=request.form.get('csrf')
     expected=session.get('csrf')
-    return bool(token and expected and secrets.compare_digest(token,expected))
+    return bool(token and expected and secrets.compare_digest(token.encode(),expected.encode()))
 def check():
     if not valid_csrf(): abort(400)
 
@@ -217,7 +265,7 @@ def home():
     if theme not in ('system','light','dark'): theme='system'
     settings_menu=f'''<div class=gear-menu><button class="theme icon-button" type=button id=gearToggle title="Настройки" aria-label="Настройки" aria-controls=settingsPanel>⚙</button><div class="card gear-popover" id=settingsPanel hidden><h3>Настройки</h3><div class=setting-line><span>Тема</span><select id=themeSelect aria-label="Тема"><option value=system {'selected' if theme=='system' else ''}>Как в системе</option><option value=light {'selected' if theme=='light' else ''}>Светлая</option><option value=dark {'selected' if theme=='dark' else ''}>Тёмная</option></select></div><div class=setting-line><span>Язык</span><select id=languageSelect aria-label="Язык"><option value=ru {'selected' if selected=='ru' else ''}>Русский</option><option value=en {'selected' if selected=='en' else ''}>English</option></select></div><div class=setting-line><button type=button id=passwordToggle>Сменить пароль</button></div><div class=password-popover id=passwordPanel hidden><h4>Смена пароля</h4><form method=post action=/password><input type=hidden name=csrf value="{tok}"><input type=password name=current_password placeholder="Текущий пароль" autocomplete=current-password required><input type=password name=new_password placeholder="Новый пароль (от 12 символов)" autocomplete=new-password minlength=12 maxlength=256 required><input type=password name=confirm_password placeholder="Повторите новый пароль" autocomplete=new-password minlength=12 maxlength=256 required><button class=primary>Сменить пароль</button></form></div></div></div>'''
     body=f'''<header class=top><div class=brand><div class=logo>H</div><div><h1>Hysteria Control</h1><small>Панель управления сервером</small></div></div><div class=top-actions>{settings_menu}<a href=/logout><button>Выйти</button></a></div></header>
-<div class=hero><div><h2>Обзор сервера</h2><p>Состояние узла и активность подключений</p></div><div class=live><span class="lamp" id=serviceLamp></span><span id=serviceText>Проверяем сервер</span><span class=pill>обновление каждые 15 сек</span></div></div>
+<div class=hero><div><h2>Обзор сервера</h2><p>Состояние узла и активность подключений</p></div><div class=live><span class="lamp" id=serviceLamp></span><span id=serviceText>Проверяем сервер</span><span class=pill>обновление каждые 5 сек</span></div></div>
 <div class=grid><div class="card metric"><div class=label>Нагрузка на процессор</div><strong><span data-metric=cpu>—</span></strong><div class=sub>текущая загрузка CPU</div></div><div class="card metric"><div class=label>Оперативная память</div><strong><span data-metric=ram>—</span></strong><div class=bar><i id=ramBar></i></div></div><div class="card metric"><div class=label>Swap</div><strong><span data-metric=swap>—</span></strong><div class=bar><i id=swapBar></i></div></div><div class="card metric"><div class=label>Диск</div><strong><span data-metric=disk>—</span></strong><div class=bar><i id=diskBar></i></div></div></div>
 <section class="card server-card"><div class=server-row><div class=server-info><span class=lamp id=serviceLamp2></span><div><h3>Hysteria2</h3><p>UDP/443 · {DOMAIN}</p></div></div><form method=post action=/sni><input type=hidden name=csrf value="{tok}"><div class=sni-row><input name=sni value="{sni}" aria-label="SNI"><button class=small>Сохранить SNI</button></div></form></div></section>
 <div class=section-head><div><h3>Статистика трафика пользователей</h3><p>Накопленные данные по всем подключениям</p></div></div>
@@ -246,7 +294,7 @@ def change_password():
         return page('<div class="card login"><h2>Текущий пароль неверен</h2><a href="/"><button>Назад</button></a></div>')
     if len(new)<12 or len(new)>256:
         return page('<div class="card login"><h2>Пароль должен содержать от 12 до 256 символов</h2><a href="/"><button>Назад</button></a></div>')
-    if not secrets.compare_digest(new,confirm):
+    if not secrets.compare_digest(new.encode(),confirm.encode()):
         return page('<div class="card login"><h2>Новые пароли не совпадают</h2><a href="/"><button>Назад</button></a></div>')
     put_setting('admin_password_hash',hash_password(new))
     put_setting('admin_auth_version',secrets.token_urlsafe(24))
@@ -340,39 +388,36 @@ def qr(username):
     c=conn(); u=c.execute('select username,password,enabled from users where username=?',(username,)).fetchone(); c.close()
     if not u: abort(404)
     uri=f'hysteria2://{username}:{u["password"]}@{DOMAIN}:443/?sni={setting("sni",DOMAIN)}&insecure=0#{username}'
-    p=subprocess.run(['qrencode','-t','PNG','-o','-','-s','6','-m','2'],input=uri.encode(),capture_output=True,check=True)
+    p=subprocess.run(['qrencode','-t','PNG','-o','-','-s','6','-m','2'],input=uri.encode(),capture_output=True,check=True,timeout=3)
     return Response(p.stdout,mimetype='image/png',headers={'Cache-Control':'no-store'})
 
 def cpu_counters():
-    a=list(map(int,open('/proc/stat').readline().split()[1:])); return sum(a),sum(a[3:5])
+    with open('/proc/stat') as f: a=list(map(int,f.readline().split()[1:]))
+    return sum(a[:8]),sum(a[3:5])
 def resources():
     global last_cpu,last_net,last_sample
     m={}
-    for line in open('/proc/meminfo'):
-        k,v=line.split(':',1); m[k]=int(v.strip().split()[0])
+    with open('/proc/meminfo') as f:
+        for line in f:
+            k,v=line.split(':',1); m[k]=int(v.strip().split()[0])
     total=m.get('MemTotal',0); avail=m.get('MemAvailable',0); st=m.get('SwapTotal',0); sf=m.get('SwapFree',0)
-    d=subprocess.check_output(['df','-Pk','/'],text=True).splitlines()[1].split(); du,dt=int(d[2]),int(d[1])
-    cpu=cpu_counters()
-    if last_cpu is None:
-        time.sleep(0.1)
-        last_cpu=cpu
+    disk=shutil.disk_usage('/'); du,dt=disk.used/1024,disk.total/1024
+    with cpu_lock:
         cpu=cpu_counters()
-    total_delta=cpu[0]-last_cpu[0]
-    idle_delta=cpu[1]-last_cpu[1]
-    cpu_pct=max(0,min(100,100*(1-idle_delta/max(1,total_delta))))
-    last_cpu=cpu
+        if last_cpu is None: last_cpu=cpu
+        total_delta=cpu[0]-last_cpu[0]; idle_delta=cpu[1]-last_cpu[1]
+        cpu_pct=max(0,min(100,100*(1-idle_delta/total_delta))) if total_delta else 0
+        last_cpu=cpu
     mb='MB' if request.cookies.get('language')=='en' else 'МБ'
-    result={'cpu':f'{cpu_pct:.0f}%', 'ram':f'{(total-avail)/1024:.0f} / {total/1024:.0f} {mb}','swap':f'{(st-sf)/1024:.0f} / {st/1024:.0f} {mb}','disk':f'{du/1024:.0f} / {dt/1024:.0f} {mb}','resources':{'ram':{'percent':round(100*(total-avail)/max(1,total))},'swap':{'percent':round(100*(st-sf)/max(1,st))},'disk':{'percent':int(d[4].rstrip('%'))}}}
+    result={'cpu':f'{cpu_pct:.0f}%', 'ram':f'{(total-avail)/1024:.0f} / {total/1024:.0f} {mb}','swap':f'{(st-sf)/1024:.0f} / {st/1024:.0f} {mb}','disk':f'{du/1024:.0f} / {dt/1024:.0f} {mb}','resources':{'ram':{'percent':round(100*(total-avail)/max(1,total))},'swap':{'percent':round(100*(st-sf)/max(1,st))},'disk':{'percent':round(100*du/max(1,dt))}}}
     return result
 @app.get('/api/metrics')
 def metrics():
     if not logged(): abort(403)
     data=resources()
-    try: online=api_get('/online'); record_traffic(); data['service']=True
-    except Exception: online={}; data['service']=False
+    state=vpn_state(); online=state['online']; data['service']=state['service']
     c=conn(); rows=c.execute('select u.username,u.enabled,coalesce(s.tx,0),coalesce(s.rx,0) from users u left join usage s using(username)').fetchall(); c.close()
-    online_by_name={str(name).lower():int(count) for name,count in online.items()}
-    data['users']={r['username']:{'online':online_by_name.get(r['username'].lower(),0) if r['enabled'] else 0,'tx':int(r[2]),'rx':int(r[3]),'enabled':bool(r['enabled'])} for r in rows}
+    data['users']={r['username']:{'online':(online.get(r['username'],0) if online is not None else None) if r['enabled'] else 0,'tx':int(r[2]),'rx':int(r[3]),'enabled':bool(r['enabled'])} for r in rows}
     return data
 @app.get('/logout')
 def logout(): session.clear(); return redirect('/')
@@ -422,7 +467,7 @@ if __name__=='__main__':
     if sys.argv[1:]==['--sync-root']:
         write_server_config()
     else:
-        auth_server=ThreadingHTTPServer(('127.0.0.1',AUTH_PORT),HysteriaAuthHandler)
+        auth_server=HysteriaAuthServer(('127.0.0.1',AUTH_PORT))
         auth_server.daemon_threads=True
         threading.Thread(target=auth_server.serve_forever,daemon=True).start()
         server=PanelServer()

@@ -4,6 +4,13 @@
 
 A lightweight, self-hosted Hysteria 2 server and web panel for managing users, connection links, QR codes, traffic, and server health. The panel is a small Flask app with SQLite; there is no Docker, Nginx, PostgreSQL, or separate frontend build. The interface supports English and Russian, with self-hosted IBM Plex fonts.
 
+### Version 0.2.8
+
+- Connection status refreshes every 5 seconds while the tab is visible. An unavailable API is shown as unknown, not offline.
+- User charts scroll horizontally inside their card without widening the page.
+- Statistics use a shared cache and one database writer to avoid duplicate accounting and polling contention. Auth and HTTPS connections are bounded and have timeouts.
+- Updates validate legacy configuration before changing it, preserve credentials, and check HTTPS, VPN authentication, and statistics. User links remain unchanged.
+
 ## One-command installation
 
 Requirements:
