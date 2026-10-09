@@ -76,7 +76,9 @@ systemctl is-active --quiet hysteria-control.service
 auth_ready=0
 for _ in $(seq 1 20); do
   if curl -fs --noproxy '*' --max-time 2 -H 'Content-Type: application/json' \
-    -d '{"auth":"invalid-update-probe"}' "http://127.0.0.1:${HYSTERIA_AUTH_PORT:-9998}/auth" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ok") is False else 1)'; then
+    -d '{"auth":"invalid-update-probe"}' "http://127.0.0.1:${HYSTERIA_AUTH_PORT:-9998}/auth" | python3 -c 'import json,sys
+try: sys.exit(0 if json.load(sys.stdin).get("ok") is False else 1)
+except (ValueError,AttributeError): sys.exit(1)'; then
     auth_ready=1; break
   fi
   sleep 1
